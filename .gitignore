@@ -1,0 +1,15 @@
+# Build artifacts
+obj/
+notagrep
+notagrep-debug
+
+# Benchmark data (generated)
+bench/data/
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+other_greps
+*.plan
