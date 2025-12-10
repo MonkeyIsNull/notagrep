@@ -182,7 +182,16 @@ typedef struct {
     void *user_data;
     size_t count;
     size_t last_match_end;
+    bool is_inner_prefilter;  // True if using inner literal prefilter
 } FindAllContext;
+
+// Find line start before position (scan backward for newline)
+static size_t find_line_start_before(const uint8_t *input, size_t pos) {
+    while (pos > 0 && input[pos - 1] != '\n') {
+        pos--;
+    }
+    return pos;
+}
 
 static void prefilter_match_handler(size_t pos, void *ctx) {
     FindAllContext *fctx = (FindAllContext *)ctx;
@@ -192,14 +201,26 @@ static void prefilter_match_handler(size_t pos, void *ctx) {
         return;
     }
 
+    // For inner prefilter (patterns like .*foo.*), the NFA must start at
+    // line start, not at the inner literal position. The .* at the beginning
+    // needs to match from line start to the inner literal.
+    size_t nfa_start = pos;
+    if (fctx->is_inner_prefilter) {
+        nfa_start = find_line_start_before(fctx->input, pos);
+        // Skip if we already matched a line starting before this one
+        if (nfa_start < fctx->last_match_end) {
+            return;
+        }
+    }
+
     Match m;
     if (nfa_match_at(fctx->re->nfa, &fctx->re->exec_ctx,
-                     fctx->input, fctx->input_len, pos, &m)) {
+                     fctx->input, fctx->input_len, nfa_start, &m)) {
         fctx->count++;
         if (fctx->user_cb) {
             fctx->user_cb(&m, fctx->user_data);
         }
-        fctx->last_match_end = m.end > pos ? m.end : pos + 1;
+        fctx->last_match_end = m.end > nfa_start ? m.end : nfa_start + 1;
     }
 }
 
@@ -262,7 +283,8 @@ size_t regex_find_all(CompiledRegex *re,
             .user_cb = cb,
             .user_data = user_data,
             .count = 0,
-            .last_match_end = 0
+            .last_match_end = 0,
+            .is_inner_prefilter = false
         };
 
         prefilter_search(&re->prefilter, input, input_len,
@@ -271,6 +293,7 @@ size_t regex_find_all(CompiledRegex *re,
     }
 
     // Inner literal prefilter: scan for inner literal, validate with NFA
+    // For patterns like .*foo.*, we find "foo" but must start NFA at line start
     if (re->has_inner_prefilter) {
         FindAllContext ctx = {
             .re = re,
@@ -279,7 +302,8 @@ size_t regex_find_all(CompiledRegex *re,
             .user_cb = cb,
             .user_data = user_data,
             .count = 0,
-            .last_match_end = 0
+            .last_match_end = 0,
+            .is_inner_prefilter = true  // Start NFA at line start
         };
 
         prefilter_search(&re->inner_prefilter, input, input_len,
@@ -430,6 +454,7 @@ typedef struct {
     void *user_data;
     size_t count;
     size_t last_match_end;
+    bool is_inner_prefilter;  // True if using inner literal prefilter
 } FindAllContextTS;
 
 static void prefilter_match_handler_ts(size_t pos, void *ctx) {
@@ -439,14 +464,24 @@ static void prefilter_match_handler_ts(size_t pos, void *ctx) {
         return;
     }
 
+    // For inner prefilter (patterns like .*foo.*), the NFA must start at
+    // line start, not at the inner literal position.
+    size_t nfa_start = pos;
+    if (fctx->is_inner_prefilter) {
+        nfa_start = find_line_start_before(fctx->input, pos);
+        if (nfa_start < fctx->last_match_end) {
+            return;
+        }
+    }
+
     Match m;
     if (nfa_match_at(fctx->re->nfa, fctx->ctx,
-                     fctx->input, fctx->input_len, pos, &m)) {
+                     fctx->input, fctx->input_len, nfa_start, &m)) {
         fctx->count++;
         if (fctx->user_cb) {
             fctx->user_cb(&m, fctx->user_data);
         }
-        fctx->last_match_end = m.end > pos ? m.end : pos + 1;
+        fctx->last_match_end = m.end > nfa_start ? m.end : nfa_start + 1;
     }
 }
 
@@ -494,7 +529,8 @@ size_t regex_find_all_ts(CompiledRegex *re, ExecContext *ctx,
             .user_cb = cb,
             .user_data = user_data,
             .count = 0,
-            .last_match_end = 0
+            .last_match_end = 0,
+            .is_inner_prefilter = false
         };
 
         prefilter_search(&re->prefilter, input, input_len,
@@ -503,6 +539,7 @@ size_t regex_find_all_ts(CompiledRegex *re, ExecContext *ctx,
     }
 
     // Inner literal prefilter: scan for inner literal, validate with NFA
+    // For patterns like .*foo.*, we find "foo" but must start NFA at line start
     if (re->has_inner_prefilter) {
         FindAllContextTS fctx = {
             .re = re,
@@ -512,7 +549,8 @@ size_t regex_find_all_ts(CompiledRegex *re, ExecContext *ctx,
             .user_cb = cb,
             .user_data = user_data,
             .count = 0,
-            .last_match_end = 0
+            .last_match_end = 0,
+            .is_inner_prefilter = true  // Start NFA at line start
         };
 
         prefilter_search(&re->inner_prefilter, input, input_len,

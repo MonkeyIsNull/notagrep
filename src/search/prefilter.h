@@ -5,9 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include "teddy.h"
+#include "packed_pair.h"
 
 // Minimum needle length for SIMD to be beneficial
-#define SIMD_MIN_NEEDLE_LEN 4
+#define SIMD_MIN_NEEDLE_LEN 2  // Teddy works with 2+ bytes
 
 typedef struct {
     uint8_t *needle;
@@ -15,6 +17,24 @@ typedef struct {
 
     // Boyer-Moore-Horspool bad character table
     size_t skip_table[256];
+
+    // Non-matching byte set: bytes that never appear in the needle
+    // Used for fast SIMD skip - if all bytes in a chunk are non-matching,
+    // we can skip the entire chunk without checking individual positions
+    uint8_t non_matching[256];  // 1 = byte never in needle, 0 = byte in needle
+    size_t non_matching_count;  // Number of non-matching bytes (0-256)
+
+    // Rare byte optimization: which byte in the needle is rarest in typical text?
+    // We search for this byte first, then verify backward/forward
+    uint8_t rare_byte;          // The rare byte value
+    size_t rare_byte_offset;    // Offset of rare byte in needle
+    uint8_t rare_byte_score;    // Rarity score (higher = rarer, 0-255)
+
+    // Git-grep style optimization: md2 (minimum delta 2)
+    // After a partial match failure, skip by this distance instead of 1
+    // This is the minimum distance to the next occurrence of the guard char
+    size_t md2;
+    uint8_t guard_char;         // Second-to-last byte (for quick rejection)
 
     // SIMD optimization state
     bool use_simd;
@@ -25,6 +45,14 @@ typedef struct {
     uint8_t first_byte_upper;
     uint8_t first_byte_lower;
     bool case_insensitive;
+
+    // Teddy SIMD searcher (embedded to avoid allocation overhead)
+    Teddy teddy;
+    bool teddy_valid;      // True if teddy was successfully initialized
+
+    // Packed Pair SIMD searcher (faster than Teddy on ARM64)
+    PackedPair packed_pair;
+    bool packed_pair_valid;  // True if packed_pair was successfully initialized
 } Prefilter;
 
 // Initialize prefilter with a literal needle

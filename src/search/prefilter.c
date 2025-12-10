@@ -1,26 +1,10 @@
 #include "prefilter.h"
 #include "ahocorasick.h"
+#include "teddy.h"
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-// Architecture detection
-#if defined(__x86_64__) || defined(_M_X64)
-    #define ARCH_X86_64
-    #include <immintrin.h>
-#elif defined(__aarch64__) || defined(_M_ARM64)
-    #define ARCH_ARM64
-    #include <arm_neon.h>
-#endif
-
-// SIMD vector size
-#if defined(ARCH_X86_64)
-    #define VECTOR_SIZE 16  // SSE2: 128-bit
-#elif defined(ARCH_ARM64)
-    #define VECTOR_SIZE 16  // NEON: 128-bit
-#else
-    #define VECTOR_SIZE 1   // No SIMD
-#endif
 
 static inline uint8_t to_lower(uint8_t c) {
     return (c >= 'A' && c <= 'Z') ? c + 32 : c;
@@ -36,8 +20,10 @@ static void build_skip_table(Prefilter *pf) {
         pf->skip_table[i] = pf->needle_len;
     }
 
-    // Set skip distances for characters in the needle (except last)
-    for (size_t i = 0; i < pf->needle_len - 1; i++) {
+    // Set skip distances for characters in the needle
+    // For BMH, we process ALL characters including the last one
+    // Last character gets skip=0 to trigger match verification
+    for (size_t i = 0; i < pf->needle_len; i++) {
         size_t skip = pf->needle_len - 1 - i;
         if (pf->case_insensitive) {
             pf->skip_table[to_lower(pf->needle[i])] = skip;
@@ -46,6 +32,113 @@ static void build_skip_table(Prefilter *pf) {
             pf->skip_table[pf->needle[i]] = skip;
         }
     }
+}
+
+// Byte frequency table for English text (lower = rarer)
+// Based on typical frequency analysis, normalized to 0-255 range
+static const uint8_t byte_frequency[256] = {
+    // Control chars (0-31): rare
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 100, 50, 255, 255, 100, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    // Space and punctuation (32-47)
+    10,   // space - very common
+    200,  // !
+    150,  // "
+    230,  // #
+    230,  // $
+    230,  // %
+    180,  // &
+    150,  // '
+    120,  // (
+    120,  // )
+    180,  // *
+    180,  // +
+    100,  // ,
+    120,  // -
+    80,   // .
+    150,  // /
+    // Digits (48-57): moderately common in code
+    90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
+    // Punctuation (58-64)
+    100,  // :
+    100,  // ;
+    150,  // <
+    80,   // =
+    150,  // >
+    200,  // ?
+    230,  // @
+    // Uppercase (65-90): less common than lowercase
+    60, 70, 70, 70, 30, 80, 80, 70, 50, 200, 200, 70, 70,
+    70, 50, 70, 230, 60, 50, 40, 80, 180, 150, 200, 150, 230,
+    // Punctuation (91-96)
+    150, 150, 150, 230, 120, 200,
+    // Lowercase (97-122): common
+    20, 80, 60, 60, 10, 80, 70, 50, 30, 200, 180, 50, 60,
+    40, 30, 60, 230, 40, 30, 20, 60, 150, 120, 180, 120, 220,
+    // Punctuation (123-127)
+    150, 180, 150, 230, 255,
+    // High bytes (128-255): rare in ASCII text
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+};
+
+// Build set of bytes that never appear in the needle
+// Also find the rarest byte in the needle for optimized search
+static void build_non_matching_set(Prefilter *pf) {
+    // Start with all bytes as non-matching
+    memset(pf->non_matching, 1, 256);
+
+    // Mark bytes that appear in the needle as matching
+    for (size_t i = 0; i < pf->needle_len; i++) {
+        if (pf->case_insensitive) {
+            pf->non_matching[to_lower(pf->needle[i])] = 0;
+            pf->non_matching[to_upper(pf->needle[i])] = 0;
+        } else {
+            pf->non_matching[pf->needle[i]] = 0;
+        }
+    }
+
+    // Count non-matching bytes
+    pf->non_matching_count = 0;
+    for (int i = 0; i < 256; i++) {
+        if (pf->non_matching[i]) {
+            pf->non_matching_count++;
+        }
+    }
+
+    // Find the rarest byte in the needle
+    // This byte will be searched for first using memchr, then we verify around it
+    pf->rare_byte = pf->needle[0];
+    pf->rare_byte_offset = 0;
+    pf->rare_byte_score = 0;
+    uint8_t max_rarity = 0;  // Higher = rarer
+
+    for (size_t i = 0; i < pf->needle_len; i++) {
+        uint8_t b = pf->needle[i];
+        uint8_t rarity;
+
+        if (pf->case_insensitive) {
+            // For case-insensitive, take the less rare of the two cases
+            uint8_t lower_rarity = byte_frequency[to_lower(b)];
+            uint8_t upper_rarity = byte_frequency[to_upper(b)];
+            rarity = (lower_rarity < upper_rarity) ? lower_rarity : upper_rarity;
+        } else {
+            rarity = byte_frequency[b];
+        }
+
+        if (rarity > max_rarity) {
+            max_rarity = rarity;
+            pf->rare_byte = b;
+            pf->rare_byte_offset = i;
+        }
+    }
+    pf->rare_byte_score = max_rarity;
 }
 
 int prefilter_init(Prefilter *pf, const uint8_t *needle, size_t len, bool case_insensitive) {
@@ -76,11 +169,55 @@ int prefilter_init(Prefilter *pf, const uint8_t *needle, size_t len, bool case_i
     // Build BMH skip table
     build_skip_table(pf);
 
-    // Enable SIMD for sufficiently long needles
-#if defined(ARCH_X86_64) || defined(ARCH_ARM64)
-    pf->use_simd = (len >= SIMD_MIN_NEEDLE_LEN);
+    // Build non-matching byte set for fast SIMD skip
+    build_non_matching_set(pf);
+
+    // Compute guard character and md2 (git-grep optimization)
+    // Guard char is second-to-last byte - checked before full verification
+    // md2 is minimum skip after partial match failure
+    if (len >= 2) {
+        pf->guard_char = case_insensitive ? to_lower(needle[len - 2]) : needle[len - 2];
+
+        // md2 = minimum distance from second-to-last position to any occurrence
+        // of the guard character elsewhere in the pattern (closer to the end)
+        pf->md2 = len;
+        for (size_t i = 0; i < len - 2; i++) {
+            uint8_t c = case_insensitive ? to_lower(needle[i]) : needle[i];
+            if (c == pf->guard_char) {
+                size_t dist = len - 2 - i;
+                if (dist < pf->md2) {
+                    pf->md2 = dist;
+                }
+            }
+        }
+        if (pf->md2 == 0) pf->md2 = 1;  // Minimum skip of 1
+    } else {
+        pf->guard_char = needle[0];
+        pf->md2 = 1;
+    }
+
+    // Initialize SIMD searchers (patterns >= 2 bytes)
+    // Use pf->needle (copied data) not needle (input parameter) since
+    // the input may be freed after this function returns
+    pf->teddy_valid = false;
+    pf->packed_pair_valid = false;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // On ARM64, use Packed Pair (faster than Teddy due to simpler SIMD ops)
+    if (len >= SIMD_MIN_NEEDLE_LEN && packed_pair_available()) {
+        if (packed_pair_init(&pf->packed_pair, pf->needle, len, case_insensitive) == 0) {
+            pf->packed_pair_valid = true;
+        }
+    }
+    pf->use_simd = pf->packed_pair_valid;
 #else
-    pf->use_simd = false;
+    // On x86-64, use Teddy (pshufb is very fast)
+    if (len >= SIMD_MIN_NEEDLE_LEN && teddy_available()) {
+        if (teddy_init(&pf->teddy, pf->needle, len, case_insensitive) == 0) {
+            pf->teddy_valid = true;
+        }
+    }
+    pf->use_simd = pf->teddy_valid;
 #endif
 
     return 0;
@@ -90,6 +227,14 @@ void prefilter_free(Prefilter *pf) {
     if (pf->needle) {
         free(pf->needle);
         pf->needle = NULL;
+    }
+    if (pf->teddy_valid) {
+        teddy_free(&pf->teddy);
+        pf->teddy_valid = false;
+    }
+    if (pf->packed_pair_valid) {
+        packed_pair_free(&pf->packed_pair);
+        pf->packed_pair_valid = false;
     }
 }
 
@@ -160,6 +305,35 @@ static int search_single_byte(const Prefilter *pf, const uint8_t *haystack, size
     return count;
 }
 
+// Rare-byte-first search: use memchr to find the rarest byte, then verify around it
+// This is faster than BMH when the rare byte is truly rare in the haystack
+static int search_rare_byte_first(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
+                                   prefilter_match_cb cb, void *ctx) {
+    int count = 0;
+    const uint8_t *p = haystack + pf->rare_byte_offset;
+    const uint8_t *end = haystack + haystack_len - (pf->needle_len - pf->rare_byte_offset - 1);
+
+    while (p < end) {
+        // Find next occurrence of the rare byte
+        const uint8_t *found = memchr(p, pf->rare_byte, end - p);
+        if (!found) break;
+
+        // Calculate where the needle would start
+        const uint8_t *needle_start = found - pf->rare_byte_offset;
+        if (needle_start >= haystack && needle_start + pf->needle_len <= haystack + haystack_len) {
+            if (verify_match(pf, needle_start)) {
+                count++;
+                if (cb) cb(needle_start - haystack, ctx);
+                p = found + pf->needle_len - pf->rare_byte_offset;
+                continue;
+            }
+        }
+        p = found + 1;
+    }
+
+    return count;
+}
+
 // Unrolled Boyer-Moore-Horspool with 10-iteration skip loop
 // This eliminates loop overhead and maximizes CPU pipeline efficiency
 static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
@@ -173,13 +347,20 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
         return search_single_byte(pf, haystack, haystack_len, cb, ctx);
     }
 
+    // Use rare-byte-first search for patterns >= 3 chars (case-sensitive only)
+    // memchr is highly SIMD-optimized in libc and often beats scalar BMH
+    // even when the "rare" byte isn't that rare
+    if (pf->needle_len >= 3 && !pf->case_insensitive) {
+        return search_rare_byte_first(pf, haystack, haystack_len, cb, ctx);
+    }
+
     int count = 0;
     const size_t *delta = pf->skip_table;
     const size_t len = pf->needle_len;
-    const uint8_t *needle = pf->needle;
 
-    // Guard character: second-to-last byte for quick rejection
-    const uint8_t gc = pf->case_insensitive ? to_lower(needle[len - 2]) : needle[len - 2];
+    // Use precomputed guard character and md2 from git-grep optimization
+    const uint8_t gc = pf->guard_char;
+    const size_t md2 = pf->md2;
 
     // tp points to where the last byte of needle would be
     const uint8_t *tp = haystack + len - 1;
@@ -224,8 +405,8 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
                     }
                 }
             }
-            // Not a full match, skip by 1 (or could use md2 like git-grep)
-            tp++;
+            // Not a full match - use md2 for smart skip (git-grep style)
+            tp += md2;
         }
     }
 
@@ -244,7 +425,7 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
                     continue;
                 }
             }
-            d = 1;
+            d = md2;  // Use md2 instead of 1
         }
         tp += d;
     }
@@ -253,195 +434,8 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
 }
 
 // =============================================================================
-// SIMD implementations
-// =============================================================================
-
-#if defined(ARCH_X86_64)
-
-static int search_simd_x86(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
-                           prefilter_match_cb cb, void *ctx) {
-    if (haystack_len < pf->needle_len) {
-        return 0;
-    }
-
-    int count = 0;
-    size_t end_pos = haystack_len - pf->needle_len;
-
-    // Broadcast first and last bytes
-    __m128i first_vec, first_vec2;
-    __m128i last_vec, last_vec2;
-
-    if (pf->case_insensitive) {
-        first_vec = _mm_set1_epi8(pf->first_byte_lower);
-        first_vec2 = _mm_set1_epi8(pf->first_byte_upper);
-        last_vec = _mm_set1_epi8(to_lower(pf->last_byte));
-        last_vec2 = _mm_set1_epi8(to_upper(pf->last_byte));
-    } else {
-        first_vec = _mm_set1_epi8(pf->first_byte);
-        last_vec = _mm_set1_epi8(pf->last_byte);
-    }
-
-    size_t i = 0;
-    size_t last_offset = pf->needle_len - 1;
-
-    // Process 16 bytes at a time
-    while (i + VECTOR_SIZE <= end_pos + 1) {
-        // Load 16 bytes at position i (first byte candidates)
-        __m128i chunk_first = _mm_loadu_si128((const __m128i *)(haystack + i));
-        // Load 16 bytes at position i + needle_len - 1 (last byte candidates)
-        __m128i chunk_last = _mm_loadu_si128((const __m128i *)(haystack + i + last_offset));
-
-        // Compare for first byte matches
-        __m128i eq_first = _mm_cmpeq_epi8(chunk_first, first_vec);
-        if (pf->case_insensitive) {
-            __m128i eq_first2 = _mm_cmpeq_epi8(chunk_first, first_vec2);
-            eq_first = _mm_or_si128(eq_first, eq_first2);
-        }
-
-        // Compare for last byte matches
-        __m128i eq_last = _mm_cmpeq_epi8(chunk_last, last_vec);
-        if (pf->case_insensitive) {
-            __m128i eq_last2 = _mm_cmpeq_epi8(chunk_last, last_vec2);
-            eq_last = _mm_or_si128(eq_last, eq_last2);
-        }
-
-        // AND the results: positions where both first and last match
-        __m128i candidates = _mm_and_si128(eq_first, eq_last);
-        int mask = _mm_movemask_epi8(candidates);
-
-        // Process each candidate
-        while (mask) {
-            int bit = __builtin_ctz(mask);
-            size_t pos = i + bit;
-
-            if (pos <= end_pos && verify_match(pf, haystack + pos)) {
-                count++;
-                if (cb) cb(pos, ctx);
-            }
-
-            mask &= mask - 1;  // Clear lowest bit
-        }
-
-        i += VECTOR_SIZE;
-    }
-
-    // Handle remaining bytes with scalar search
-    while (i <= end_pos) {
-        bool first_match;
-        if (pf->case_insensitive) {
-            uint8_t c = to_lower(haystack[i]);
-            first_match = (c == pf->first_byte_lower);
-        } else {
-            first_match = (haystack[i] == pf->first_byte);
-        }
-
-        if (first_match && verify_match(pf, haystack + i)) {
-            count++;
-            if (cb) cb(i, ctx);
-        }
-        i++;
-    }
-
-    return count;
-}
-
-#elif defined(ARCH_ARM64)
-
-static int search_simd_arm(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
-                           prefilter_match_cb cb, void *ctx) {
-    if (haystack_len < pf->needle_len) {
-        return 0;
-    }
-
-    int count = 0;
-    size_t end_pos = haystack_len - pf->needle_len;
-
-    // Broadcast first and last bytes
-    uint8x16_t first_vec, first_vec2;
-    uint8x16_t last_vec, last_vec2;
-
-    if (pf->case_insensitive) {
-        first_vec = vdupq_n_u8(pf->first_byte_lower);
-        first_vec2 = vdupq_n_u8(pf->first_byte_upper);
-        last_vec = vdupq_n_u8(to_lower(pf->last_byte));
-        last_vec2 = vdupq_n_u8(to_upper(pf->last_byte));
-    } else {
-        first_vec = vdupq_n_u8(pf->first_byte);
-        last_vec = vdupq_n_u8(pf->last_byte);
-    }
-
-    size_t i = 0;
-    size_t last_offset = pf->needle_len - 1;
-
-    // Process 16 bytes at a time
-    while (i + VECTOR_SIZE <= end_pos + 1) {
-        // Load 16 bytes
-        uint8x16_t chunk_first = vld1q_u8(haystack + i);
-        uint8x16_t chunk_last = vld1q_u8(haystack + i + last_offset);
-
-        // Compare for first byte matches
-        uint8x16_t eq_first = vceqq_u8(chunk_first, first_vec);
-        if (pf->case_insensitive) {
-            uint8x16_t eq_first2 = vceqq_u8(chunk_first, first_vec2);
-            eq_first = vorrq_u8(eq_first, eq_first2);
-        }
-
-        // Compare for last byte matches
-        uint8x16_t eq_last = vceqq_u8(chunk_last, last_vec);
-        if (pf->case_insensitive) {
-            uint8x16_t eq_last2 = vceqq_u8(chunk_last, last_vec2);
-            eq_last = vorrq_u8(eq_last, eq_last2);
-        }
-
-        // AND the results
-        uint8x16_t candidates = vandq_u8(eq_first, eq_last);
-
-        // Check if any candidates exist (fast path)
-        uint64_t low = vgetq_lane_u64(vreinterpretq_u64_u8(candidates), 0);
-        uint64_t high = vgetq_lane_u64(vreinterpretq_u64_u8(candidates), 1);
-
-        if (low | high) {
-            // Extract candidate positions
-            uint8_t mask_bytes[16];
-            vst1q_u8(mask_bytes, candidates);
-
-            for (int j = 0; j < 16; j++) {
-                if (mask_bytes[j] && i + j <= end_pos) {
-                    if (verify_match(pf, haystack + i + j)) {
-                        count++;
-                        if (cb) cb(i + j, ctx);
-                    }
-                }
-            }
-        }
-
-        i += VECTOR_SIZE;
-    }
-
-    // Handle remaining bytes with scalar search
-    while (i <= end_pos) {
-        bool first_match;
-        if (pf->case_insensitive) {
-            uint8_t c = to_lower(haystack[i]);
-            first_match = (c == pf->first_byte_lower);
-        } else {
-            first_match = (haystack[i] == pf->first_byte);
-        }
-
-        if (first_match && verify_match(pf, haystack + i)) {
-            count++;
-            if (cb) cb(i, ctx);
-        }
-        i++;
-    }
-
-    return count;
-}
-
-#endif
-
-// =============================================================================
 // Public API
+// Note: SIMD search uses Packed Pair on ARM64, Teddy on x86-64
 // =============================================================================
 
 int prefilter_search(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
@@ -450,16 +444,20 @@ int prefilter_search(const Prefilter *pf, const uint8_t *haystack, size_t haysta
         return -1;
     }
 
-#if defined(ARCH_X86_64)
-    if (pf->use_simd) {
-        return search_simd_x86(pf, haystack, haystack_len, cb, ctx);
+    // Single-byte patterns: use memchr (highly SIMD-optimized in libc)
+    if (pf->needle_len == 1) {
+        return search_single_byte(pf, haystack, haystack_len, cb, ctx);
     }
-#elif defined(ARCH_ARM64)
-    if (pf->use_simd) {
-        return search_simd_arm(pf, haystack, haystack_len, cb, ctx);
+
+    // Use Teddy on x86-64 (pshufb is fast there)
+    // On ARM64, fall through to scalar BMH which uses rare-byte-first search
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (pf->teddy_valid) {
+        return teddy_search(&pf->teddy, haystack, haystack_len, cb, ctx);
     }
 #endif
 
+    // Fallback to BMH (handles case-insensitive short patterns, etc.)
     return search_scalar_bmh(pf, haystack, haystack_len, cb, ctx);
 }
 
@@ -481,6 +479,37 @@ ssize_t prefilter_find_first(const Prefilter *pf, const uint8_t *haystack, size_
             const uint8_t *found = memchr(haystack, pf->needle[0], haystack_len);
             return found ? (ssize_t)(found - haystack) : -1;
         }
+    }
+
+    // Use platform-specific SIMD search (patterns >= 2 bytes)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (pf->packed_pair_valid) {
+        return packed_pair_find_first(&pf->packed_pair, haystack, haystack_len);
+    }
+#else
+    if (pf->teddy_valid) {
+        return teddy_find_first(&pf->teddy, haystack, haystack_len);
+    }
+#endif
+
+    // Fallback: Use rare-byte-first for case-sensitive patterns >= 3 chars
+    if (pf->needle_len >= 3 && !pf->case_insensitive) {
+        const uint8_t *p = haystack + pf->rare_byte_offset;
+        const uint8_t *end = haystack + haystack_len - (pf->needle_len - pf->rare_byte_offset - 1);
+
+        while (p < end) {
+            const uint8_t *found = memchr(p, pf->rare_byte, end - p);
+            if (!found) break;
+
+            const uint8_t *needle_start = found - pf->rare_byte_offset;
+            if (needle_start >= haystack && needle_start + pf->needle_len <= haystack + haystack_len) {
+                if (verify_match(pf, needle_start)) {
+                    return (ssize_t)(needle_start - haystack);
+                }
+            }
+            p = found + 1;
+        }
+        return -1;
     }
 
     const size_t *delta = pf->skip_table;

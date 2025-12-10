@@ -9,6 +9,7 @@ DATA_DIR="$SCRIPT_DIR/data"
 
 GREP="/usr/bin/grep"
 RG="/opt/homebrew/bin/rg"
+GG="git"  # git grep --no-index
 NOTAGREP="$PROJECT_DIR/notagrep"
 
 RUNS=5  # Number of runs per benchmark
@@ -33,6 +34,11 @@ check_prereqs() {
     if [ ! -x "$RG" ]; then
         echo "Warning: ripgrep not found at $RG"
         RG=""
+    fi
+
+    if ! command -v $GG &> /dev/null; then
+        echo "Warning: git not found, skipping git-grep benchmarks"
+        GG=""
     fi
 
     if [ ! -f "$DATA_DIR/small.txt" ]; then
@@ -110,16 +116,18 @@ format_speedup() {
 
 # Print table separator
 sep() {
-    echo "------------------------+----------+----------+----------+------------+------------"
+    echo "------------------------+----------+----------+----------+----------+------------+------------+------------"
 }
 
 # Print table header
 header() {
     printf "${BOLD}%-24s${NC}" "Test"
     printf "|${BOLD}%9s ${NC}" "grep"
+    printf "|${BOLD}%9s ${NC}" "git-grep"
     printf "|${BOLD}%9s ${NC}" "ripgrep"
     printf "|${BOLD}%9s ${NC}" "notagrep"
     printf "|${BOLD}%11s ${NC}" "vs grep"
+    printf "|${BOLD}%11s ${NC}" "vs git-grep"
     printf "|${BOLD}%11s${NC}\n" "vs ripgrep"
 }
 
@@ -127,11 +135,18 @@ header() {
 print_row() {
     local name="$1"
     local t_grep="$2"
-    local t_rg="$3"
-    local t_ng="$4"
+    local t_gg="$3"
+    local t_rg="$4"
+    local t_ng="$5"
 
     printf "%-24s" "$name"
     printf "|%s " "$(format_time $t_grep)"
+
+    if [ -n "$t_gg" ]; then
+        printf "|%s " "$(format_time $t_gg)"
+    else
+        printf "|%9s " "N/A"
+    fi
 
     if [ -n "$t_rg" ]; then
         printf "|%s " "$(format_time $t_rg)"
@@ -146,6 +161,16 @@ print_row() {
     printf "|"
     format_speedup $vs_grep "grep"
     printf "     "
+
+    # vs git-grep
+    if [ -n "$t_gg" ]; then
+        local vs_gg=$(calc_speedup $t_gg $t_ng)
+        printf "|"
+        format_speedup $vs_gg "gg"
+        printf "     "
+    else
+        printf "|%11s " "N/A"
+    fi
 
     # vs ripgrep
     if [ -n "$t_rg" ]; then
@@ -171,6 +196,7 @@ echo "========================"
 echo
 echo "Tools:"
 echo "  grep:     $GREP"
+[ -n "$GG" ] && echo "  git-grep: $GG grep --no-index"
 [ -n "$RG" ] && echo "  ripgrep:  $RG"
 echo "  notagrep: $NOTAGREP"
 echo
@@ -187,6 +213,7 @@ fi
 
 # Store all results for summary
 declare -a ALL_GREP_TIMES
+declare -a ALL_GG_TIMES
 declare -a ALL_RG_TIMES
 declare -a ALL_NG_TIMES
 declare -a ALL_NAMES
@@ -206,104 +233,118 @@ sep
 # --- Fixed String Search (-F) ---
 
 t_grep=$(run_bench "grep" "$GREP -F 'function' '$DATA_DIR/small.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -F 'function' -- '$DATA_DIR/small.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -F 'function' '$DATA_DIR/small.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP -F 'function' '$DATA_DIR/small.txt'")
-print_row "literal 100KB" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="literal 100KB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "literal 100KB" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="literal 100KB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 t_grep=$(run_bench "grep" "$GREP -F 'function' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -F 'function' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -F 'function' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP -F 'function' '$DATA_DIR/medium.txt'")
-print_row "literal 10MB" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="literal 10MB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "literal 10MB" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="literal 10MB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 t_grep=$(run_bench "grep" "$GREP -F 'function' '$DATA_DIR/large.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -F 'function' -- '$DATA_DIR/large.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -F 'function' '$DATA_DIR/large.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP -F 'function' '$DATA_DIR/large.txt'")
-print_row "literal 100MB" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="literal 100MB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "literal 100MB" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="literal 100MB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 # --- Case-insensitive search ---
 
 t_grep=$(run_bench "grep" "$GREP -iF 'FUNCTION' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -iF 'FUNCTION' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -iF 'FUNCTION' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP -iF 'FUNCTION' '$DATA_DIR/medium.txt'")
-print_row "literal -i 10MB" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="literal -i 10MB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "literal -i 10MB" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="literal -i 10MB"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 sep
 
 # --- Regex: Simple patterns ---
 
 t_grep=$(run_bench "grep" "$GREP -E 'func' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E 'func' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG 'func' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP 'func' '$DATA_DIR/medium.txt'")
-print_row "regex literal" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex literal"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex literal" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex literal"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 t_grep=$(run_bench "grep" "$GREP -E 'func.*return' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E 'func.*return' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG 'func.*return' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP 'func.*return' '$DATA_DIR/medium.txt'")
-print_row "regex .*" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex .*"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex .*" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex .*"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 # --- Regex: Character classes ---
 
 t_grep=$(run_bench "grep" "$GREP -E '[a-z]+_[0-9]+' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '[a-z]+_[0-9]+' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '[a-z]+_[0-9]+' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '[a-z]+_[0-9]+' '$DATA_DIR/medium.txt'")
-print_row "regex [a-z]+_[0-9]+" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex [a-z]+_[0-9]+"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex [a-z]+_[0-9]+" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex [a-z]+_[0-9]+"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 t_grep=$(run_bench "grep" "$GREP -E '[0-9]{1,3}\.[0-9]{1,3}' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '[0-9]{1,3}\\.[0-9]{1,3}' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '[0-9]{1,3}\.[0-9]{1,3}' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '[0-9]{1,3}\.[0-9]{1,3}' '$DATA_DIR/medium.txt'")
-print_row "regex IP-like" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex IP-like"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex IP-like" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex IP-like"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 # --- Regex: Alternation ---
 
 t_grep=$(run_bench "grep" "$GREP -E '(error|warning|fatal)' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '(error|warning|fatal)' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '(error|warning|fatal)' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '(error|warning|fatal)' '$DATA_DIR/medium.txt'")
-print_row "regex alternation" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex alternation"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex alternation" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex alternation"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 t_grep=$(run_bench "grep" "$GREP -E '(int|char|void|long|short|float|double)' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '(int|char|void|long|short|float|double)' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '(int|char|void|long|short|float|double)' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '(int|char|void|long|short|float|double)' '$DATA_DIR/medium.txt'")
-print_row "regex 7-way alt" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex 7-way alt"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex 7-way alt" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex 7-way alt"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 # --- Regex: Anchored patterns ---
 
 t_grep=$(run_bench "grep" "$GREP -E '^#include' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '^#include' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '^#include' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '^#include' '$DATA_DIR/medium.txt'")
-print_row "regex ^anchor" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex ^anchor"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex ^anchor" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex ^anchor"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 t_grep=$(run_bench "grep" "$GREP -E ';$' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E ';$' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG ';$' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP ';\$' '$DATA_DIR/medium.txt'")
-print_row "regex anchor\$" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex anchor\$"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex anchor\$" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex anchor\$"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 # --- Regex: Complex patterns ---
 
 t_grep=$(run_bench "grep" "$GREP -E '(struct|typedef).*\{' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '(struct|typedef).*\\{' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '(struct|typedef).*\{' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '(struct|typedef).*\{' '$DATA_DIR/medium.txt'")
-print_row "regex struct def" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex struct def"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex struct def" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex struct def"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 # --- Regex: Dot-star heavy (pathological for some engines) ---
 
 t_grep=$(run_bench "grep" "$GREP -E '.*function.*' '$DATA_DIR/medium.txt'")
+[ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -E '.*function.*' -- '$DATA_DIR/medium.txt'") || t_gg=""
 [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '.*function.*' '$DATA_DIR/medium.txt'") || t_rg=""
 t_ng=$(run_bench "notagrep" "$NOTAGREP '.*function.*' '$DATA_DIR/medium.txt'")
-print_row "regex .*X.*" "$t_grep" "$t_rg" "$t_ng"
-ALL_NAMES[$idx]="regex .*X.*"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+print_row "regex .*X.*" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+ALL_NAMES[$idx]="regex .*X.*"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
 sep
 echo
@@ -322,31 +363,35 @@ if [ -n "$INCLUDE_DIR" ]; then
 
     # Literal recursive
     t_grep=$(run_bench "grep" "$GREP -rF 'include' '$INCLUDE_DIR'")
+    [ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -rF 'include' -- '$INCLUDE_DIR'") || t_gg=""
     [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -F 'include' '$INCLUDE_DIR'") || t_rg=""
     t_ng=$(run_bench "notagrep" "$NOTAGREP -F 'include' '$INCLUDE_DIR'")
-    print_row "dir literal" "$t_grep" "$t_rg" "$t_ng"
-    ALL_NAMES[$idx]="dir literal"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+    print_row "dir literal" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+    ALL_NAMES[$idx]="dir literal"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
     # Regex recursive
     t_grep=$(run_bench "grep" "$GREP -rE '[a-z]+_t' '$INCLUDE_DIR'")
+    [ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -rE '[a-z]+_t' -- '$INCLUDE_DIR'") || t_gg=""
     [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG '[a-z]+_t' '$INCLUDE_DIR'") || t_rg=""
     t_ng=$(run_bench "notagrep" "$NOTAGREP '[a-z]+_t' '$INCLUDE_DIR'")
-    print_row "dir regex" "$t_grep" "$t_rg" "$t_ng"
-    ALL_NAMES[$idx]="dir regex"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+    print_row "dir regex" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+    ALL_NAMES[$idx]="dir regex"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
     # Files-only mode (-l)
     t_grep=$(run_bench "grep" "$GREP -rlF 'stdio' '$INCLUDE_DIR'")
+    [ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -rlF 'stdio' -- '$INCLUDE_DIR'") || t_gg=""
     [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -lF 'stdio' '$INCLUDE_DIR'") || t_rg=""
     t_ng=$(run_bench "notagrep" "$NOTAGREP -lF 'stdio' '$INCLUDE_DIR'")
-    print_row "dir -l (files only)" "$t_grep" "$t_rg" "$t_ng"
-    ALL_NAMES[$idx]="dir -l"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+    print_row "dir -l (files only)" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+    ALL_NAMES[$idx]="dir -l"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
     # Case-insensitive recursive
     t_grep=$(run_bench "grep" "$GREP -riF 'ERROR' '$INCLUDE_DIR'")
+    [ -n "$GG" ] && t_gg=$(run_bench "git-grep" "$GG grep --no-index -riF 'ERROR' -- '$INCLUDE_DIR'") || t_gg=""
     [ -n "$RG" ] && t_rg=$(run_bench "rg" "$RG -iF 'ERROR' '$INCLUDE_DIR'") || t_rg=""
     t_ng=$(run_bench "notagrep" "$NOTAGREP -iF 'ERROR' '$INCLUDE_DIR'")
-    print_row "dir -i literal" "$t_grep" "$t_rg" "$t_ng"
-    ALL_NAMES[$idx]="dir -i literal"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
+    print_row "dir -i literal" "$t_grep" "$t_gg" "$t_rg" "$t_ng"
+    ALL_NAMES[$idx]="dir -i literal"; ALL_GREP_TIMES[$idx]=$t_grep; ALL_GG_TIMES[$idx]=$t_gg; ALL_RG_TIMES[$idx]=$t_rg; ALL_NG_TIMES[$idx]=$t_ng; ((idx++))
 
     sep
     echo
@@ -362,10 +407,13 @@ echo
 
 # Calculate stats
 total_vs_grep=0
+total_vs_gg=0
 total_vs_rg=0
 wins_vs_grep=0
+wins_vs_gg=0
 wins_vs_rg=0
 count=0
+gg_count=0
 
 for ((i=0; i<idx; i++)); do
     if [ -n "${ALL_NG_TIMES[$i]}" ] && (( $(echo "${ALL_NG_TIMES[$i]} > 0" | bc -l) )); then
@@ -374,6 +422,17 @@ for ((i=0; i<idx; i++)); do
             total_vs_grep=$(echo "$total_vs_grep + $vs_grep" | bc -l)
             if (( $(echo "$vs_grep >= 1" | bc -l) )); then
                 ((wins_vs_grep++))
+            fi
+        fi
+
+        if [ -n "${ALL_GG_TIMES[$i]}" ] && [ "${ALL_GG_TIMES[$i]}" != "" ]; then
+            vs_gg=$(calc_speedup ${ALL_GG_TIMES[$i]} ${ALL_NG_TIMES[$i]})
+            if [ "$vs_gg" != "0" ]; then
+                total_vs_gg=$(echo "$total_vs_gg + $vs_gg" | bc -l)
+                if (( $(echo "$vs_gg >= 1" | bc -l) )); then
+                    ((wins_vs_gg++))
+                fi
+                ((gg_count++))
             fi
         fi
 
@@ -391,6 +450,7 @@ for ((i=0; i<idx; i++)); do
 done
 
 avg_vs_grep=$(echo "scale=2; $total_vs_grep / $count" | bc -l)
+[ $gg_count -gt 0 ] && avg_vs_gg=$(echo "scale=2; $total_vs_gg / $gg_count" | bc -l) || avg_vs_gg="0"
 avg_vs_rg=$(echo "scale=2; $total_vs_rg / $count" | bc -l)
 
 echo "Tests run: $count"
@@ -399,6 +459,21 @@ echo "vs grep:"
 echo "  Average speedup: ${avg_vs_grep}x"
 echo "  Tests faster:    $wins_vs_grep / $count"
 echo
+
+if [ -n "$GG" ] && [ $gg_count -gt 0 ]; then
+    echo "vs git-grep:"
+    echo "  Average speedup: ${avg_vs_gg}x"
+    echo "  Tests faster:    $wins_vs_gg / $gg_count"
+    echo
+
+    if (( $(echo "$avg_vs_gg >= 1" | bc -l) )); then
+        echo -e "${GREEN}notagrep is ${avg_vs_gg}x faster than git-grep on average${NC}"
+    else
+        inv=$(echo "scale=2; 1 / $avg_vs_gg" | bc -l)
+        echo -e "${YELLOW}notagrep is ${inv}x slower than git-grep on average${NC}"
+    fi
+    echo
+fi
 
 if [ -n "$RG" ]; then
     echo "vs ripgrep:"

@@ -21,7 +21,11 @@ typedef struct {
     const uint8_t *data;
     size_t data_len;
     size_t match_count;
+    size_t lines_matched;      // Number of unique lines with matches
+    size_t last_line_start;    // Start of last printed line (to avoid duplicates)
+    size_t last_line_end;      // End of last printed line (for forward scanning)
     bool printed_filename;     // For -l mode
+    bool printed_any_line;     // Whether we've printed any line yet
 } Printer;
 
 // Initialize printer for a file
