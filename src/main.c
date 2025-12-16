@@ -156,6 +156,14 @@ static bool search_file_worker(const char *path, ThreadContext *tctx) {
             if (prefilter_contains(global->pattern->prefilter, fb->data, fb->size)) {
                 mctx.found_any = true;
             }
+        } else if (global->cfg->count_only) {
+            // Optimized path for count mode - uses SIMD with integrated line counting
+            size_t lines = prefilter_count_lines(global->pattern->prefilter, fb->data, fb->size);
+            if (lines > 0) {
+                mctx.found_any = true;
+                // Directly update printer state for count mode (bypass callback overhead)
+                printer.lines_matched = lines;
+            }
         } else {
             prefilter_search(global->pattern->prefilter, fb->data, fb->size,
                             prefilter_match_handler, &mctx);

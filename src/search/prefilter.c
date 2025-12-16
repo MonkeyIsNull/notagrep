@@ -38,58 +38,25 @@ static void build_skip_table(Prefilter *pf) {
     }
 }
 
-// Byte frequency table for English text (lower = rarer)
-// Based on typical frequency analysis, normalized to 0-255 range
+// Byte frequency table (higher = rarer, derived from ripgrep/memchr)
+// This matches ripgrep's empirical byte frequency data, inverted so higher = rarer
 static const uint8_t byte_frequency[256] = {
-    // Control chars (0-31): rare
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 100, 50, 255, 255, 100, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    // Space and punctuation (32-47)
-    10,   // space - very common
-    200,  // !
-    150,  // "
-    230,  // #
-    230,  // $
-    230,  // %
-    180,  // &
-    150,  // '
-    120,  // (
-    120,  // )
-    180,  // *
-    180,  // +
-    100,  // ,
-    120,  // -
-    80,   // .
-    150,  // /
-    // Digits (48-57): moderately common in code
-    90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
-    // Punctuation (58-64)
-    100,  // :
-    100,  // ;
-    150,  // <
-    80,   // =
-    150,  // >
-    200,  // ?
-    230,  // @
-    // Uppercase (65-90): less common than lowercase
-    60, 70, 70, 70, 30, 80, 80, 70, 50, 200, 200, 70, 70,
-    70, 50, 70, 230, 60, 50, 40, 80, 180, 150, 200, 150, 230,
-    // Punctuation (91-96)
-    150, 150, 150, 230, 120, 200,
-    // Lowercase (97-122): common
-    20, 80, 60, 60, 10, 80, 70, 50, 30, 200, 180, 50, 60,
-    40, 30, 60, 230, 40, 30, 20, 60, 150, 120, 180, 120, 220,
-    // Punctuation (123-127)
-    150, 180, 150, 230, 255,
-    // High bytes (128-255): rare in ASCII text
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    200,203,204,205,206,207,208,209,210,152, 13,189,188, 26,211,212,
+    213,214,215,216,217,218,219,220,221,222,199,223,224,225,226,227,
+      0,107, 91,106,119, 95,100, 82, 34, 33,121,133, 23, 53, 40, 31,
+     47, 35, 51, 68, 72, 76, 78, 87, 77, 55, 29, 60,101, 71, 81,129,
+    135, 64, 98, 61, 85, 66, 93, 94,105, 62,113,118, 84, 79, 70, 88,
+     69,143, 80, 63, 67, 99,115,112,132,122,127,108,117,109,141, 32,
+    104,  6, 39, 17, 19,  2, 28, 37, 25,  8,120, 75, 14, 22,  9, 11,
+     24,116, 10, 12,  4, 20, 54, 59, 15, 41,103, 73, 50, 74,128,228,
+    255,254,253,252,251,250,249,248,247,246,245,244,243,242,241,240,
+    239,238,237,236,235,234,233,232,231,230,229,228,227,226,225,224,
+    223,222,221,220,219,218,217,216,215,214,213,212,211,210,209,208,
+    207,206,205,204,203,202,201,200,199,198,197,196,195,194,193,192,
+    191,190,189,188,187,186,185,184,183,182,181,180,179,178,177,176,
+    175,174,173,172,171,170,169,168,167,166,165,164,163,162,161,160,
+    159,158,157,156,155,154,153,152,151,150,149,148,147,146,145,144,
+    143,142,141,140,139,138,137,136,135,134,133,132,131,130,129,128
 };
 
 // Build set of bytes that never appear in the needle
@@ -116,33 +83,53 @@ static void build_non_matching_set(Prefilter *pf) {
         }
     }
 
-    // Find the rarest byte in the needle
-    // This byte will be searched for first using memchr, then we verify around it
-    pf->rare_byte = pf->needle[0];
-    pf->rare_byte_offset = 0;
-    pf->rare_byte_score = 0;
-    uint8_t max_rarity = 0;  // Higher = rarer
+    // Find the two rarest bytes in the needle (for packed pair SIMD search)
+    // This is the ripgrep/memchr approach - search for 2 rare bytes simultaneously
+    pf->rare1 = pf->needle[0];
+    pf->rare1_offset = 0;
+    pf->rare2 = pf->needle[pf->needle_len > 1 ? 1 : 0];
+    pf->rare2_offset = pf->needle_len > 1 ? 1 : 0;
 
-    for (size_t i = 0; i < pf->needle_len; i++) {
+    uint8_t rare1_score = byte_frequency[pf->rare1];
+    uint8_t rare2_score = byte_frequency[pf->rare2];
+
+    // Ensure rare1 is rarer than rare2
+    if (rare2_score > rare1_score) {
+        uint8_t tmp = pf->rare1; pf->rare1 = pf->rare2; pf->rare2 = tmp;
+        size_t tmp_off = pf->rare1_offset; pf->rare1_offset = pf->rare2_offset; pf->rare2_offset = tmp_off;
+        uint8_t tmp_score = rare1_score; rare1_score = rare2_score; rare2_score = tmp_score;
+    }
+
+    for (size_t i = 2; i < pf->needle_len; i++) {
         uint8_t b = pf->needle[i];
-        uint8_t rarity;
+        uint8_t rarity = byte_frequency[b];
 
         if (pf->case_insensitive) {
-            // For case-insensitive, take the less rare of the two cases
             uint8_t lower_rarity = byte_frequency[to_lower(b)];
             uint8_t upper_rarity = byte_frequency[to_upper(b)];
             rarity = (lower_rarity < upper_rarity) ? lower_rarity : upper_rarity;
-        } else {
-            rarity = byte_frequency[b];
         }
 
-        if (rarity > max_rarity) {
-            max_rarity = rarity;
-            pf->rare_byte = b;
-            pf->rare_byte_offset = i;
+        if (rarity > rare1_score) {
+            // New rarest - old rare1 becomes rare2
+            pf->rare2 = pf->rare1;
+            pf->rare2_offset = pf->rare1_offset;
+            rare2_score = rare1_score;
+            pf->rare1 = b;
+            pf->rare1_offset = i;
+            rare1_score = rarity;
+        } else if (i != pf->rare1_offset && rarity > rare2_score) {
+            // New second rarest
+            pf->rare2 = b;
+            pf->rare2_offset = i;
+            rare2_score = rarity;
         }
     }
-    pf->rare_byte_score = max_rarity;
+
+    // Legacy fields for backward compatibility
+    pf->rare_byte = pf->rare1;
+    pf->rare_byte_offset = pf->rare1_offset;
+    pf->rare_byte_score = rare1_score;
 }
 
 int prefilter_init(Prefilter *pf, const uint8_t *needle, size_t len, bool case_insensitive) {
@@ -363,69 +350,83 @@ static int search_rare_byte_first(const Prefilter *pf, const uint8_t *haystack, 
 #if defined(__aarch64__) || defined(_M_ARM64)
 
 // Convert NEON comparison result to bitmask using vshrn_n_u16
-// Each match byte (0xFF) becomes a set bit in the result
+// Each match byte (0xFF) becomes set bits at 4-bit intervals in the result
+// After masking with 0x8888..., each match has 1 bit set every 4 positions
 static inline uint64_t neon_movemask(uint8x16_t v) {
-    // Reinterpret as 16-bit elements and shift right to extract high bits
+    // Reinterpret as 16-bit elements and shift right by 4, then narrow
     uint16x8_t v16 = vreinterpretq_u16_u8(v);
     uint8x8_t narrowed = vshrn_n_u16(v16, 4);
-    // Extract as 64-bit value - matches are spaced 4 bits apart
-    return vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
+    // Extract as 64-bit value and mask to isolate MSB of each nibble
+    // This matches ripgrep's approach: 1 bit per lane at 4-bit intervals
+    return vget_lane_u64(vreinterpret_u64_u8(narrowed), 0) & 0x8888888888888888ULL;
 }
 
-// 4-byte prefix SIMD search
-static int search_simd_prefix(const Prefilter *pf, const uint8_t *haystack,
-                              size_t haystack_len, prefilter_match_cb cb, void *ctx) {
-    if (pf->needle_len < 4) {
+// Packed pair SIMD search - ripgrep's approach
+// Uses 2 rare bytes with only 2 vector loads per iteration (half the bandwidth of 4-byte prefix)
+static int search_simd_packed_pair(const Prefilter *pf, const uint8_t *haystack,
+                                   size_t haystack_len, prefilter_match_cb cb, void *ctx) {
+    if (pf->needle_len < 2) {
         return search_rare_byte_first(pf, haystack, haystack_len, cb, ctx);
     }
 
     int count = 0;
+    const uint8_t *start = haystack;
     const uint8_t *p = haystack;
     const uint8_t *end = haystack + haystack_len - pf->needle_len + 1;
 
-    const uint8x16_t b0 = vdupq_n_u8(pf->needle[0]);
-    const uint8x16_t b1 = vdupq_n_u8(pf->needle[1]);
-    const uint8x16_t b2 = vdupq_n_u8(pf->needle[2]);
-    const uint8x16_t b3 = vdupq_n_u8(pf->needle[3]);
+    // Get the two rare byte positions
+    const size_t idx1 = pf->rare1_offset;
+    const size_t idx2 = pf->rare2_offset;
+    const size_t max_idx = (idx1 > idx2) ? idx1 : idx2;
 
-    // Main SIMD loop
-    while (p + 16 + 3 <= end) {
-        uint8x16_t hay0 = vld1q_u8(p);
-        uint8x16_t hay1 = vld1q_u8(p + 1);
-        uint8x16_t hay2 = vld1q_u8(p + 2);
-        uint8x16_t hay3 = vld1q_u8(p + 3);
+    // Splat the two rare bytes
+    const uint8x16_t v1 = vdupq_n_u8(pf->rare1);
+    const uint8x16_t v2 = vdupq_n_u8(pf->rare2);
 
-        uint8x16_t match = vandq_u8(
-            vandq_u8(vceqq_u8(hay0, b0), vceqq_u8(hay1, b1)),
-            vandq_u8(vceqq_u8(hay2, b2), vceqq_u8(hay3, b3)));
+    // Cache needle pointer and length for verification
+    const uint8_t *needle = pf->needle;
+    const size_t needle_len = pf->needle_len;
 
-        // Quick check if any prefix matches before extracting mask
-        if (vmaxvq_u8(match) != 0xFF) {
-            p += 16;
-            continue;
-        }
+    // Main SIMD loop - only 2 loads per iteration!
+    while (p + 16 + max_idx <= end) {
+        // Load at the two rare byte offsets
+        uint8x16_t chunk1 = vld1q_u8(p + idx1);
+        uint8x16_t chunk2 = vld1q_u8(p + idx2);
 
+        // Compare both bytes
+        uint8x16_t eq1 = vceqq_u8(chunk1, v1);
+        uint8x16_t eq2 = vceqq_u8(chunk2, v2);
+        uint8x16_t match = vandq_u8(eq1, eq2);
+
+        // Extract match positions using movemask
         uint64_t mask = neon_movemask(match);
         while (mask) {
+            // With 0x8888 mask, bits are at positions 3, 7, 11, 15... (MSB of each nibble)
+            // Divide trailing zeros by 4 to get lane index
             int idx = __builtin_ctzll(mask) >> 2;
-            if (p + idx < end && memcmp(p + idx, pf->needle, pf->needle_len) == 0) {
-                count++;
-                if (cb) cb((p + idx) - haystack, ctx);
+            const uint8_t *candidate = p + idx;
+            // Inline memcmp for small needles - avoid function call overhead
+            if (candidate < end) {
+                size_t i = 0;
+                while (i < needle_len && candidate[i] == needle[i]) i++;
+                if (i == needle_len) {
+                    count++;
+                    if (cb) cb(candidate - start, ctx);
+                }
             }
-            mask &= ~(0xFULL << (idx << 2));
+            // Clear this bit - since mask is sparse (0x8888), we can just clear the one bit
+            mask &= mask - 1;
         }
         p += 16;
     }
 
-    // Scalar tail
-    uint32_t prefix;
-    memcpy(&prefix, pf->needle, 4);
+    // Scalar tail - check remaining positions
     while (p < end) {
-        uint32_t hay_prefix;
-        memcpy(&hay_prefix, p, 4);
-        if (hay_prefix == prefix && memcmp(p, pf->needle, pf->needle_len) == 0) {
-            count++;
-            if (cb) cb(p - haystack, ctx);
+        if (p[idx1] == pf->rare1 && p[idx2] == pf->rare2) {
+            if (memcmp(p, pf->needle, pf->needle_len) == 0) {
+                count++;
+                if (cb) cb(p - start, ctx);
+            }
         }
         p++;
     }
@@ -448,11 +449,11 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
         return search_single_byte(pf, haystack, haystack_len, cb, ctx);
     }
 
-    // Use SIMD 4-byte prefix search for large files on ARM64
-    // This is faster than rare-byte-first for patterns >= 4 bytes on large data
+    // Use packed pair SIMD search for large files on ARM64
+    // This uses ripgrep's approach: 2 rare bytes with only 2 vector loads
 #if defined(__aarch64__) || defined(_M_ARM64)
-    if (pf->needle_len >= 4 && !pf->case_insensitive && haystack_len >= 64 * 1024) {
-        return search_simd_prefix(pf, haystack, haystack_len, cb, ctx);
+    if (pf->needle_len >= 2 && !pf->case_insensitive && haystack_len >= 64 * 1024) {
+        return search_simd_packed_pair(pf, haystack, haystack_len, cb, ctx);
     }
 #endif
 
@@ -687,6 +688,132 @@ ssize_t prefilter_find_first(const Prefilter *pf, const uint8_t *haystack, size_
 
 bool prefilter_contains(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len) {
     return prefilter_find_first(pf, haystack, haystack_len) >= 0;
+}
+
+// =============================================================================
+// Specialized line counting (for -c mode)
+// Uses SIMD packed pair search with integrated line counting for efficiency
+// =============================================================================
+#if defined(__aarch64__) || defined(_M_ARM64)
+static size_t count_lines_simd_packed_pair(const Prefilter *pf, const uint8_t *haystack,
+                                           size_t haystack_len) {
+    if (pf->needle_len < 2) {
+        // Fallback for single-byte patterns
+        size_t lines = 0;
+        size_t last_line_end = 0;
+        const uint8_t *p = haystack;
+        const uint8_t *end = haystack + haystack_len;
+        while (p < end) {
+            p = memchr(p, pf->needle[0], end - p);
+            if (!p) break;
+            size_t pos = p - haystack;
+            if (pos > last_line_end) {
+                lines++;
+                const uint8_t *nl = memchr(p, '\n', end - p);
+                last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
+            }
+            p++;
+        }
+        return lines;
+    }
+
+    size_t lines = 0;
+    const uint8_t *p = haystack;
+    const uint8_t *end = haystack + haystack_len - pf->needle_len + 1;
+    size_t last_line_end = 0;
+
+    const size_t idx1 = pf->rare1_offset;
+    const size_t idx2 = pf->rare2_offset;
+    const size_t max_idx = (idx1 > idx2) ? idx1 : idx2;
+
+    const uint8x16_t v1 = vdupq_n_u8(pf->rare1);
+    const uint8x16_t v2 = vdupq_n_u8(pf->rare2);
+
+    const uint8_t *needle = pf->needle;
+    const size_t needle_len = pf->needle_len;
+
+    // Main SIMD loop
+    while (p + 16 + max_idx <= end) {
+        uint8x16_t chunk1 = vld1q_u8(p + idx1);
+        uint8x16_t chunk2 = vld1q_u8(p + idx2);
+        uint8x16_t eq1 = vceqq_u8(chunk1, v1);
+        uint8x16_t eq2 = vceqq_u8(chunk2, v2);
+        uint8x16_t match = vandq_u8(eq1, eq2);
+
+        uint64_t mask = neon_movemask(match);
+        while (mask) {
+            int idx = __builtin_ctzll(mask) >> 2;
+            const uint8_t *candidate = p + idx;
+            if (candidate < end) {
+                // Inline memcmp
+                size_t i = 0;
+                while (i < needle_len && candidate[i] == needle[i]) i++;
+                if (i == needle_len) {
+                    size_t pos = candidate - haystack;
+                    if (pos > last_line_end) {
+                        lines++;
+                        // Find end of line using memchr (fast)
+                        const uint8_t *nl = memchr(candidate, '\n', haystack + haystack_len - candidate);
+                        last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
+                    }
+                }
+            }
+            mask &= mask - 1;
+        }
+        p += 16;
+    }
+
+    // Scalar tail
+    while (p < end) {
+        if (p[idx1] == pf->rare1 && p[idx2] == pf->rare2) {
+            size_t i = 0;
+            while (i < needle_len && p[i] == needle[i]) i++;
+            if (i == needle_len) {
+                size_t pos = p - haystack;
+                if (pos > last_line_end) {
+                    lines++;
+                    const uint8_t *nl = memchr(p, '\n', haystack + haystack_len - p);
+                    last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
+                }
+            }
+        }
+        p++;
+    }
+
+    return lines;
+}
+#endif
+
+size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // Use SIMD packed pair for large files (case-sensitive only for now)
+    if (pf->needle_len >= 2 && !pf->case_insensitive && haystack_len >= 64 * 1024) {
+        return count_lines_simd_packed_pair(pf, haystack, haystack_len);
+    }
+#endif
+
+    // Fallback: use regular search with inline line counting
+    size_t lines = 0;
+    size_t last_line_end = 0;
+
+    // Use the existing prefilter_search infrastructure but count locally
+    const uint8_t *p = haystack;
+    const uint8_t *end = haystack + haystack_len;
+
+    while (p < end) {
+        ssize_t found = prefilter_find_first(pf, p, end - p);
+        if (found < 0) break;
+
+        size_t pos = (p - haystack) + found;
+        if (pos > last_line_end) {
+            lines++;
+            const uint8_t *nl = memchr(haystack + pos, '\n', haystack_len - pos);
+            last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
+        }
+        p = haystack + pos + 1;  // Move past this match
+    }
+
+    return lines;
 }
 
 // =============================================================================

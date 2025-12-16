@@ -24,8 +24,14 @@ typedef struct {
     uint8_t non_matching[256];  // 1 = byte never in needle, 0 = byte in needle
     size_t non_matching_count;  // Number of non-matching bytes (0-256)
 
-    // Rare byte optimization: which byte in the needle is rarest in typical text?
-    // We search for this byte first, then verify backward/forward
+    // Rare byte optimization: two rarest bytes in the needle for packed pair search
+    // We search for both bytes simultaneously with SIMD, then verify full pattern
+    uint8_t rare1;              // Rarest byte value
+    size_t rare1_offset;        // Offset of rarest byte in needle
+    uint8_t rare2;              // Second rarest byte value
+    size_t rare2_offset;        // Offset of second rarest byte in needle
+
+    // Legacy single rare byte (for rare-byte-first search fallback)
     uint8_t rare_byte;          // The rare byte value
     size_t rare_byte_offset;    // Offset of rare byte in needle
     uint8_t rare_byte_score;    // Rarity score (higher = rarer, 0-255)
@@ -77,6 +83,10 @@ ssize_t prefilter_find_first(const Prefilter *pf, const uint8_t *haystack, size_
 // Check if needle exists in haystack (for -l/-q modes)
 // Returns true if at least one match exists
 bool prefilter_contains(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len);
+
+// Count number of unique lines containing the needle (for -c mode)
+// This is more efficient than using prefilter_search with a callback
+size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len);
 
 // =============================================================================
 // Multi-literal prefilter (for alternation patterns)
