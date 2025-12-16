@@ -1,5 +1,9 @@
 # notagrep
 
+![notagrep cat](notagrep_cat.jpg)
+
+> "Никакого кофе в мире не хватит, чтобы ускорить grep"
+
 A high-performance grep implementation written in C, designed to compete with tools like ripgrep.
 
 ## Warning
