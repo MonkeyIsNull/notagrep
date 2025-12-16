@@ -448,16 +448,9 @@ int prefilter_search(const Prefilter *pf, const uint8_t *haystack, size_t haysta
         return search_single_byte(pf, haystack, haystack_len, cb, ctx);
     }
 
-    // Use platform-specific SIMD search for patterns >= 2 bytes
-#if defined(__aarch64__) || defined(_M_ARM64)
-    // On ARM64, use packed_pair (memmem) for case-sensitive patterns only
-    // Case-insensitive uses rare-byte-first which is faster for that case
-    if (pf->packed_pair_valid && !pf->case_insensitive) {
-        return packed_pair_search(&pf->packed_pair, haystack, haystack_len,
-                                  (packed_pair_match_cb)cb, ctx);
-    }
-#else
-    // On x86-64, use Teddy (pshufb is fast there)
+    // Use Teddy on x86-64 (pshufb is fast there)
+    // On ARM64, fall through to scalar BMH which uses rare-byte-first search
+#if !defined(__aarch64__) && !defined(_M_ARM64)
     if (pf->teddy_valid) {
         return teddy_search(&pf->teddy, haystack, haystack_len, cb, ctx);
     }
