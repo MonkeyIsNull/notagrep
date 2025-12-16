@@ -348,8 +348,7 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
     }
 
     // Use rare-byte-first search for patterns >= 3 chars (case-sensitive only)
-    // memchr is highly SIMD-optimized in libc and often beats scalar BMH
-    // even when the "rare" byte isn't that rare
+    // This uses memchr to find the rarest byte in the pattern, then verifies
     if (pf->needle_len >= 3 && !pf->case_insensitive) {
         return search_rare_byte_first(pf, haystack, haystack_len, cb, ctx);
     }
@@ -449,9 +448,16 @@ int prefilter_search(const Prefilter *pf, const uint8_t *haystack, size_t haysta
         return search_single_byte(pf, haystack, haystack_len, cb, ctx);
     }
 
-    // Use Teddy on x86-64 (pshufb is fast there)
-    // On ARM64, fall through to scalar BMH which uses rare-byte-first search
-#if !defined(__aarch64__) && !defined(_M_ARM64)
+    // Use platform-specific SIMD search for patterns >= 2 bytes
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // On ARM64, use packed_pair (memmem) for case-sensitive patterns only
+    // Case-insensitive uses rare-byte-first which is faster for that case
+    if (pf->packed_pair_valid && !pf->case_insensitive) {
+        return packed_pair_search(&pf->packed_pair, haystack, haystack_len,
+                                  (packed_pair_match_cb)cb, ctx);
+    }
+#else
+    // On x86-64, use Teddy (pshufb is fast there)
     if (pf->teddy_valid) {
         return teddy_search(&pf->teddy, haystack, haystack_len, cb, ctx);
     }

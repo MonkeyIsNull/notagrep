@@ -2,6 +2,9 @@
 
 A high-performance grep implementation written in C, designed to compete with tools like ripgrep.
 
+## Warning
+This is alpha freaking ware and not ready for real usage.... yet
+
 ## Algorithm References
 
 Clean-room implementations based on these academic papers:
