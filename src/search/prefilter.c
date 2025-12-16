@@ -5,6 +5,10 @@
 #include <string.h>
 #include <ctype.h>
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 
 static inline uint8_t to_lower(uint8_t c) {
     return (c >= 'A' && c <= 'Z') ? c + 32 : c;
@@ -249,11 +253,29 @@ static inline int memcmp_ci(const uint8_t *a, const uint8_t *b, size_t n) {
 }
 
 // Verify match at position (case-sensitive or insensitive)
+// Uses Raita algorithm order: last, first, middle, then full comparison
+// This statistically rejects mismatches faster than sequential comparison
 static inline bool verify_match(const Prefilter *pf, const uint8_t *pos) {
+    const size_t len = pf->needle_len;
+
     if (pf->case_insensitive) {
-        return memcmp_ci(pos, pf->needle, pf->needle_len) == 0;
+        // Raita order for case-insensitive
+        if (to_lower(pos[len - 1]) != to_lower(pf->needle[len - 1])) return false;
+        if (to_lower(pos[0]) != to_lower(pf->needle[0])) return false;
+        if (len > 2) {
+            size_t mid = len / 2;
+            if (to_lower(pos[mid]) != to_lower(pf->needle[mid])) return false;
+        }
+        return memcmp_ci(pos, pf->needle, len) == 0;
     } else {
-        return memcmp(pos, pf->needle, pf->needle_len) == 0;
+        // Raita order for case-sensitive: last, first, middle, then full
+        if (pos[len - 1] != pf->needle[len - 1]) return false;
+        if (pos[0] != pf->needle[0]) return false;
+        if (len > 2) {
+            size_t mid = len / 2;
+            if (pos[mid] != pf->needle[mid]) return false;
+        }
+        return memcmp(pos, pf->needle, len) == 0;
     }
 }
 
@@ -334,6 +356,93 @@ static int search_rare_byte_first(const Prefilter *pf, const uint8_t *haystack, 
     return count;
 }
 
+// =============================================================================
+// SIMD 4-byte prefix search (ARM64 NEON)
+// Checks first 4 bytes of pattern across 16 positions in parallel
+// =============================================================================
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+static int search_simd_prefix(const Prefilter *pf, const uint8_t *haystack,
+                              size_t haystack_len, prefilter_match_cb cb, void *ctx) {
+    // Fall back for short patterns
+    if (pf->needle_len < 4) {
+        return search_rare_byte_first(pf, haystack, haystack_len, cb, ctx);
+    }
+
+    int count = 0;
+    const uint8_t *p = haystack;
+    const uint8_t *end = haystack + haystack_len - pf->needle_len + 1;
+
+    // Get first 4 bytes of pattern as a 32-bit value
+    uint32_t prefix;
+    memcpy(&prefix, pf->needle, 4);
+
+    // Create vectors for byte-by-byte comparison of the 4-byte prefix
+    const uint8x16_t b0 = vdupq_n_u8(pf->needle[0]);
+    const uint8x16_t b1 = vdupq_n_u8(pf->needle[1]);
+    const uint8x16_t b2 = vdupq_n_u8(pf->needle[2]);
+    const uint8x16_t b3 = vdupq_n_u8(pf->needle[3]);
+
+    // Process 16 bytes at a time
+    while (p + 16 + 3 <= end) {
+        // Load 19 bytes (16 positions, each needing 4 bytes for prefix check)
+        // But we only have 16-byte vectors, so check positions 0-12 (13 positions)
+        uint8x16_t hay0 = vld1q_u8(p);
+        uint8x16_t hay1 = vld1q_u8(p + 1);
+        uint8x16_t hay2 = vld1q_u8(p + 2);
+        uint8x16_t hay3 = vld1q_u8(p + 3);
+
+        // Compare each byte of prefix across all positions
+        uint8x16_t cmp0 = vceqq_u8(hay0, b0);  // First byte matches
+        uint8x16_t cmp1 = vceqq_u8(hay1, b1);  // Second byte matches
+        uint8x16_t cmp2 = vceqq_u8(hay2, b2);  // Third byte matches
+        uint8x16_t cmp3 = vceqq_u8(hay3, b3);  // Fourth byte matches
+
+        // All 4 bytes must match: AND all comparisons together
+        uint8x16_t match = vandq_u8(vandq_u8(cmp0, cmp1), vandq_u8(cmp2, cmp3));
+
+        // Check if any position has a full 4-byte prefix match
+        // Use max reduction to check if any byte is 0xFF (match)
+        uint8_t max_val = vmaxvq_u8(match);
+        if (max_val == 0xFF) {
+            // At least one match - extract match positions from vector
+            uint8_t match_bytes[16];
+            vst1q_u8(match_bytes, match);
+
+            // Check all 16 positions where the 4-byte prefix was tested
+            for (int i = 0; i < 16 && p + i < end; i++) {
+                if (match_bytes[i] == 0xFF) {
+                    // Prefix matched at position i, verify full pattern
+                    if (memcmp(p + i, pf->needle, pf->needle_len) == 0) {
+                        count++;
+                        if (cb) cb((p + i) - haystack, ctx);
+                    }
+                }
+            }
+        }
+
+        p += 16;
+    }
+
+    // Handle remaining bytes with scalar search
+    while (p < end) {
+        // Quick prefix check
+        uint32_t hay_prefix;
+        memcpy(&hay_prefix, p, 4);
+        if (hay_prefix == prefix) {
+            if (memcmp(p, pf->needle, pf->needle_len) == 0) {
+                count++;
+                if (cb) cb(p - haystack, ctx);
+            }
+        }
+        p++;
+    }
+
+    return count;
+}
+
+#endif // __aarch64__
+
 // Unrolled Boyer-Moore-Horspool with 10-iteration skip loop
 // This eliminates loop overhead and maximizes CPU pipeline efficiency
 static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
@@ -346,6 +455,14 @@ static int search_scalar_bmh(const Prefilter *pf, const uint8_t *haystack, size_
     if (pf->needle_len == 1) {
         return search_single_byte(pf, haystack, haystack_len, cb, ctx);
     }
+
+    // Use SIMD 4-byte prefix search for large files on ARM64
+    // This is faster than rare-byte-first for patterns >= 4 bytes on large data
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (pf->needle_len >= 4 && !pf->case_insensitive && haystack_len >= 64 * 1024) {
+        return search_simd_prefix(pf, haystack, haystack_len, cb, ctx);
+    }
+#endif
 
     // Use rare-byte-first search for patterns >= 3 chars (case-sensitive only)
     // This uses memchr to find the rarest byte in the pattern, then verifies
