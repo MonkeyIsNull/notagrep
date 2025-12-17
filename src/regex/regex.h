@@ -30,6 +30,12 @@ typedef struct {
     // Inner literal prefilter (for patterns like .*foo.*)
     bool has_inner_prefilter;
     Prefilter inner_prefilter;
+    bool is_pure_inner_literal;  // True if pattern is JUST .*X.* (can skip NFA)
+
+    // All-literals prefilter (for patterns like func.*return)
+    // Uses multi-literal SIMD search to find any literal, then verifies with NFA
+    bool has_all_literals_prefilter;
+    MultiPrefilter all_literals_prefilter;
 
     // Required byte fallback (for patterns with no extractable literal)
     bool has_required_byte;

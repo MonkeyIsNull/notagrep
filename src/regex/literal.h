@@ -64,4 +64,48 @@ bool inner_literal_extract(const AstNode *ast, InnerLiteralInfo *info);
 // Free resources in InnerLiteralInfo
 void inner_literal_info_free(InnerLiteralInfo *info);
 
+// =============================================================================
+// All-literals extraction (for patterns like prefix.*suffix)
+// =============================================================================
+
+// Result of extracting all literals from a pattern
+// For patterns like "func.*return", extracts both "func" and "return"
+typedef struct {
+    uint8_t *literals[MAX_ALT_LITERALS];  // Array of literal strings
+    size_t lens[MAX_ALT_LITERALS];        // Length of each literal
+    size_t count;                          // Number of literals
+} AllLiteralsInfo;
+
+// Extract all literals from an AST for use as a multi-pattern prefilter
+// This is useful for patterns like "prefix.*suffix" where we want to find
+// candidates matching either prefix OR suffix, then verify with NFA
+// Returns true if useful literals were found (at least 2)
+// Caller must call all_literals_info_free if returns true
+bool all_literals_extract(const AstNode *ast, AllLiteralsInfo *info);
+
+// Free resources in AllLiteralsInfo
+void all_literals_info_free(AllLiteralsInfo *info);
+
+// =============================================================================
+// Pure inner literal detection
+// =============================================================================
+
+// Check if the pattern is a "pure inner literal" - i.e., just .*X.*
+// These patterns match any line containing the literal X, so we can skip NFA
+// Examples that ARE pure inner literals:
+//   .*function.*     (dot-star, literal, dot-star)
+//   .+function.+     (dot-plus, literal, dot-plus)
+//   function         (just literal - trivially pure)
+//   .*function       (dot-star, literal, optional trailing)
+//   function.*       (literal, dot-star, optional leading)
+// Examples that are NOT pure inner literals:
+//   ^.*function.*$   (has anchors)
+//   .*func.*tion.*   (multiple literals with .* between)
+//   .*[a-z]+.*       (has character class, not literal)
+//   .*func(a|b).*    (has alternation)
+//
+// Returns true if pattern is pure inner literal, and optionally extracts
+// the literal bytes into *lit and *len (caller must free *lit)
+bool is_pure_inner_literal(const AstNode *ast, uint8_t **lit, size_t *len);
+
 #endif // NOTAGREP_REGEX_LITERAL_H

@@ -3,6 +3,30 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Check if a character is a regex metacharacter that requires parsing
+static bool is_regex_metachar(char c) {
+    switch (c) {
+        case '.': case '*': case '+': case '?':
+        case '[': case ']': case '(': case ')':
+        case '{': case '}': case '|': case '^':
+        case '$': case '\\':
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Check if pattern contains NO regex metacharacters (pure literal)
+// This allows us to skip regex parsing entirely for simple strings
+static bool is_pure_literal_pattern(const char *pattern, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (is_regex_metachar(pattern[i])) {
+            return false;
+        }
+    }
+    return len > 0;  // Empty pattern is not a pure literal
+}
+
 CompiledRegex *regex_compile(const char *pattern, size_t len,
                              bool case_insensitive, bool bytes_mode,
                              ParseError *err) {
@@ -10,6 +34,48 @@ CompiledRegex *regex_compile(const char *pattern, size_t len,
     if (!re) return NULL;
 
     re->case_insensitive = case_insensitive;
+
+    // FAST PATH: Pure literal patterns (no regex metacharacters)
+    // Skip regex parsing entirely - use direct prefilter search
+    if (is_pure_literal_pattern(pattern, len)) {
+        if (prefilter_init(&re->prefilter, (const uint8_t *)pattern, len,
+                          case_insensitive) == 0) {
+            re->has_prefilter = true;
+            re->prefilter_is_exact = true;
+
+            // We still need a minimal NFA for correctness in edge cases
+            // but the hot paths (count_lines, contains, find_all) will
+            // bypass NFA entirely due to prefilter_is_exact
+            ParseOptions opts = {
+                .case_insensitive = case_insensitive,
+                .bytes_mode = bytes_mode
+            };
+            AstNode *ast = regex_parse(pattern, len, &opts, err);
+            if (!ast) {
+                prefilter_free(&re->prefilter);
+                free(re);
+                return NULL;
+            }
+            re->nfa = nfa_compile(ast);
+            ast_free(ast);
+
+            if (!re->nfa) {
+                prefilter_free(&re->prefilter);
+                free(re);
+                return NULL;
+            }
+
+            if (exec_context_init(&re->exec_ctx, re->nfa->count) < 0) {
+                nfa_free(re->nfa);
+                prefilter_free(&re->prefilter);
+                free(re);
+                return NULL;
+            }
+
+            return re;  // Early return - skip all other prefilter extraction
+        }
+        // If prefilter_init failed, fall through to normal path
+    }
 
     // Parse pattern
     ParseOptions opts = {
@@ -45,6 +111,22 @@ CompiledRegex *regex_compile(const char *pattern, size_t len,
                           case_insensitive) == 0) {
             re->has_prefilter = true;
             re->prefilter_is_exact = lit_info.is_exact;
+
+            // For non-exact prefix patterns (like func.*return), also extract
+            // ALL literals to use as a more efficient multi-literal prefilter.
+            // This allows us to quickly find candidate lines by searching for
+            // ANY literal, then run NFA only once per line containing a match.
+            if (!re->prefilter_is_exact && !case_insensitive) {
+                AllLiteralsInfo all_info;
+                if (all_literals_extract(ast, &all_info)) {
+                    if (multi_prefilter_init(&re->all_literals_prefilter,
+                                             all_info.literals, all_info.lens,
+                                             all_info.count, false) == 0) {
+                        re->has_all_literals_prefilter = true;
+                    }
+                    all_literals_info_free(&all_info);
+                }
+            }
         }
         literal_info_free(&lit_info);
     }
@@ -71,6 +153,12 @@ CompiledRegex *regex_compile(const char *pattern, size_t len,
             if (prefilter_init(&re->inner_prefilter, inner_info.bytes, inner_info.len,
                               case_insensitive) == 0) {
                 re->has_inner_prefilter = true;
+
+                // Check if this is a PURE inner literal (just .*X.*)
+                // If so, we can skip NFA entirely - any line containing X matches
+                if (!case_insensitive) {
+                    re->is_pure_inner_literal = is_pure_inner_literal(ast, NULL, NULL);
+                }
             }
             inner_literal_info_free(&inner_info);
         }
@@ -127,6 +215,10 @@ void regex_free(CompiledRegex *re) {
 
     if (re->has_inner_prefilter) {
         prefilter_free(&re->inner_prefilter);
+    }
+
+    if (re->has_all_literals_prefilter) {
+        multi_prefilter_free(&re->all_literals_prefilter);
     }
 
     free(re);
@@ -542,6 +634,27 @@ size_t regex_find_all_ts(CompiledRegex *re, ExecContext *ctx,
     // Inner literal prefilter: scan for inner literal, validate with NFA
     // For patterns like .*foo.*, we find "foo" but must start NFA at line start
     if (re->has_inner_prefilter) {
+        // Fast path: PURE inner literal (.*X.*) - no NFA verification needed!
+        if (re->is_pure_inner_literal) {
+            // Every match of the literal is a valid regex match
+            size_t count = 0;
+            size_t pos = 0;
+            while (pos < input_len) {
+                ssize_t found = prefilter_find_first(&re->inner_prefilter,
+                                                      input + pos, input_len - pos);
+                if (found < 0) break;
+
+                count++;
+                if (cb) {
+                    Match m = { .start = pos + found,
+                                .end = pos + found + re->inner_prefilter.needle_len };
+                    cb(&m, user_data);
+                }
+                pos += found + re->inner_prefilter.needle_len;
+            }
+            return count;
+        }
+
         FindAllContextTS fctx = {
             .re = re,
             .ctx = ctx,
@@ -634,6 +747,11 @@ bool regex_contains_ts(CompiledRegex *re, ExecContext *ctx,
             return false;  // Inner literal not present, no match possible
         }
 
+        // Fast path: PURE inner literal (.*X.*) - no NFA needed!
+        if (re->is_pure_inner_literal) {
+            return true;  // Literal found = match found
+        }
+
         // Inner literal found, verify with NFA
         return regex_find_first_ts(re, ctx, input, input_len, NULL);
     }
@@ -654,11 +772,15 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
         return multi_prefilter_count_lines(&re->multi_prefilter, input, input_len);
     }
 
-    // Fast path: inner literal for .*X.* patterns
-    // If the pattern is JUST .*literal.*, then any line containing literal matches
+    // Fast path: PURE inner literal (.*X.*) - no NFA needed!
+    // Any line containing the literal matches.
+    if (re->has_inner_prefilter && re->is_pure_inner_literal) {
+        return prefilter_count_lines(&re->inner_prefilter, input, input_len);
+    }
+
+    // Fast path: inner literal for .*X.* patterns (but not pure - need NFA)
     if (re->has_inner_prefilter) {
-        // TODO: Detect pure .*X.* patterns and skip NFA entirely
-        // For now, use inner literal prefilter with NFA verification
+        // Use inner literal prefilter with NFA verification
         size_t lines = 0;
         size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match is counted
         size_t pos = 0;
@@ -704,6 +826,65 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
 
     // Prefix prefilter + NFA with line counting
     if (re->has_prefilter) {
+        // If we have all-literals prefilter (e.g., for "func.*return"),
+        // use multi-literal SIMD to find candidate lines more efficiently
+        if (re->has_all_literals_prefilter && re->all_literals_prefilter.use_teddy_multi) {
+            // Use TeddyMulti SIMD to find ANY literal, then verify with NFA
+            // Strategy: find any literal, get the line, then use prefix literal
+            // to find the actual start position for NFA verification
+            size_t lines = 0;
+            size_t last_line_end = SIZE_MAX;
+            size_t pos = 0;
+
+            while (pos < input_len) {
+                // Find next occurrence of ANY literal
+                size_t match_pos;
+                size_t pattern_idx;
+                if (!teddy_multi_find_first(&re->all_literals_prefilter.teddy_multi,
+                                            input + pos, input_len - pos,
+                                            &match_pos, &pattern_idx)) {
+                    break;  // No more matches
+                }
+
+                size_t candidate = pos + match_pos;
+
+                // Find line boundaries
+                size_t line_st = candidate;
+                while (line_st > 0 && input[line_st - 1] != '\n') {
+                    line_st--;
+                }
+                const uint8_t *nl = memchr(input + candidate, '\n', input_len - candidate);
+                size_t line_ed = nl ? (size_t)(nl - input) : input_len;
+
+                // Skip if we already counted this line
+                if (last_line_end != SIZE_MAX && line_st <= last_line_end) {
+                    pos = line_ed + 1;
+                    continue;
+                }
+
+                // Now find the prefix literal on this line for proper NFA starting position
+                ssize_t prefix_pos = prefilter_find_first(&re->prefilter,
+                                                           input + line_st, line_ed - line_st);
+                if (prefix_pos < 0) {
+                    // No prefix on this line - skip
+                    pos = line_ed + 1;
+                    continue;
+                }
+
+                // Verify with NFA starting at prefix position
+                size_t nfa_start = line_st + (size_t)prefix_pos;
+                Match m;
+                if (nfa_match_at(re->nfa, ctx, input, input_len, nfa_start, &m)) {
+                    lines++;
+                    last_line_end = line_ed;
+                }
+
+                pos = line_ed + 1;
+            }
+            return lines;
+        }
+
+        // Standard prefix prefilter path
         size_t lines = 0;
         size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match is counted
         size_t pos = 0;
@@ -762,6 +943,30 @@ void regex_debug_print(const CompiledRegex *re, const char *pattern) {
         }
         fprintf(stderr, "\" (%zu bytes)\n", re->prefilter.needle_len);
         fprintf(stderr, "  Is exact: %s\n", re->prefilter_is_exact ? "YES (no NFA needed)" : "no");
+        if (re->has_all_literals_prefilter) {
+            fprintf(stderr, "  All-literals prefilter: %zu patterns (for fast candidate finding)\n",
+                    re->all_literals_prefilter.count);
+            // Access TeddyMulti patterns if using TeddyMulti
+            if (re->all_literals_prefilter.use_teddy_multi) {
+                for (size_t i = 0; i < re->all_literals_prefilter.teddy_multi.pattern_count && i < 8; i++) {
+                    fprintf(stderr, "    [%zu] \"", i);
+                    for (size_t j = 0; j < re->all_literals_prefilter.teddy_multi.pattern_lens[i]; j++) {
+                        uint8_t c = re->all_literals_prefilter.teddy_multi.patterns[i][j];
+                        if (c >= 32 && c < 127) {
+                            fputc(c, stderr);
+                        } else {
+                            fprintf(stderr, "\\x%02x", c);
+                        }
+                    }
+                    fprintf(stderr, "\" (%zu bytes)\n", re->all_literals_prefilter.teddy_multi.pattern_lens[i]);
+                }
+            } else if (re->all_literals_prefilter.pattern_lens) {
+                // Fall back to pattern_lens for display
+                for (size_t i = 0; i < re->all_literals_prefilter.count && i < 8; i++) {
+                    fprintf(stderr, "    [%zu] (%zu bytes)\n", i, re->all_literals_prefilter.pattern_lens[i]);
+                }
+            }
+        }
     } else if (re->has_multi_prefilter) {
         fprintf(stderr, "\nPrefilter: MULTI_LITERAL (alternation)\n");
         fprintf(stderr, "  Pattern count: %zu\n", re->multi_prefilter.count);
@@ -791,6 +996,7 @@ void regex_debug_print(const CompiledRegex *re, const char *pattern) {
             }
         }
         fprintf(stderr, "\" (%zu bytes)\n", re->inner_prefilter.needle_len);
+        fprintf(stderr, "  Is pure inner: %s\n", re->is_pure_inner_literal ? "YES (no NFA needed)" : "no");
     } else if (re->has_required_byte) {
         fprintf(stderr, "\nPrefilter: REQUIRED_BYTE (fallback)\n");
         fprintf(stderr, "  Byte: 0x%02x", re->required_byte);

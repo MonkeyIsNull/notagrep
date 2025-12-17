@@ -211,27 +211,55 @@ static int teddy_multi_search_neon(const TeddyMulti *t, const uint8_t *hay, size
         uint8x16_t cand1 = vandq_u8(res1_lo, res1_hi);
         uint8x16_t candidates = vandq_u8(cand0, cand1);
 
-        // Extract candidate positions
-        // Store to memory and iterate (ARM doesn't have great movemask)
-        uint8_t cand_bytes[16];
-        vst1q_u8(cand_bytes, candidates);
+        // Fast check: any candidates at all? (vmaxvq_u8 is single-cycle on M1)
+        uint8_t max_val = vmaxvq_u8(candidates);
+        if (max_val != 0) {
+            // There are candidates - extract and verify
+            // Use lane extraction instead of memory store for hot path
+            uint64x2_t as_u64 = vreinterpretq_u64_u8(candidates);
+            uint64_t lo64 = vgetq_lane_u64(as_u64, 0);
+            uint64_t hi64 = vgetq_lane_u64(as_u64, 1);
 
-        for (int j = 0; j < 16; j++) {
-            uint8_t bucket_mask = cand_bytes[j];
-            if (bucket_mask == 0) continue;
+            // Process low 8 bytes
+            while (lo64) {
+                int byte_idx = __builtin_ctzll(lo64) >> 3;
+                uint8_t bucket_mask = (lo64 >> (byte_idx * 8)) & 0xFF;
 
-            size_t pos = i + j;
-            int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
-            if (pat_idx >= 0) {
-                if (cb) {
-                    TeddyMultiMatch m = {
-                        .pos = pos,
-                        .pattern_idx = (size_t)pat_idx,
-                        .pattern_len = t->pattern_lens[pat_idx]
-                    };
-                    cb(&m, ctx);
+                size_t pos = i + byte_idx;
+                int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
+                if (pat_idx >= 0) {
+                    if (cb) {
+                        TeddyMultiMatch m = {
+                            .pos = pos,
+                            .pattern_idx = (size_t)pat_idx,
+                            .pattern_len = t->pattern_lens[pat_idx]
+                        };
+                        cb(&m, ctx);
+                    }
+                    matches++;
                 }
-                matches++;
+                lo64 &= ~(0xFFULL << (byte_idx * 8));
+            }
+
+            // Process high 8 bytes
+            while (hi64) {
+                int byte_idx = __builtin_ctzll(hi64) >> 3;
+                uint8_t bucket_mask = (hi64 >> (byte_idx * 8)) & 0xFF;
+
+                size_t pos = i + 8 + byte_idx;
+                int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
+                if (pat_idx >= 0) {
+                    if (cb) {
+                        TeddyMultiMatch m = {
+                            .pos = pos,
+                            .pattern_idx = (size_t)pat_idx,
+                            .pattern_len = t->pattern_lens[pat_idx]
+                        };
+                        cb(&m, ctx);
+                    }
+                    matches++;
+                }
+                hi64 &= ~(0xFFULL << (byte_idx * 8));
             }
         }
 
@@ -298,26 +326,42 @@ static bool teddy_multi_find_first_neon(const TeddyMulti *t, const uint8_t *hay,
         uint8x16_t cand1 = vandq_u8(res1_lo, res1_hi);
         uint8x16_t candidates = vandq_u8(cand0, cand1);
 
-        // Quick check if any candidates
-        uint64x2_t as_u64 = vreinterpretq_u64_u8(candidates);
-        uint64_t lo64 = vgetq_lane_u64(as_u64, 0);
-        uint64_t hi64 = vgetq_lane_u64(as_u64, 1);
+        // Fast check: any candidates at all?
+        uint8_t max_val = vmaxvq_u8(candidates);
+        if (max_val != 0) {
+            // Use lane extraction instead of memory store
+            uint64x2_t as_u64 = vreinterpretq_u64_u8(candidates);
+            uint64_t lo64 = vgetq_lane_u64(as_u64, 0);
+            uint64_t hi64 = vgetq_lane_u64(as_u64, 1);
 
-        if (lo64 | hi64) {
-            uint8_t cand_bytes[16];
-            vst1q_u8(cand_bytes, candidates);
+            // Process low 8 bytes first (for find_first, order matters)
+            while (lo64) {
+                int byte_idx = __builtin_ctzll(lo64) >> 3;
+                uint8_t bucket_mask = (lo64 >> (byte_idx * 8)) & 0xFF;
 
-            for (int j = 0; j < 16; j++) {
-                uint8_t bucket_mask = cand_bytes[j];
-                if (bucket_mask == 0) continue;
-
-                size_t pos = i + j;
+                size_t pos = i + byte_idx;
                 int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
                 if (pat_idx >= 0) {
                     if (out_pos) *out_pos = pos;
                     if (out_pattern_idx) *out_pattern_idx = (size_t)pat_idx;
                     return true;
                 }
+                lo64 &= ~(0xFFULL << (byte_idx * 8));
+            }
+
+            // Process high 8 bytes
+            while (hi64) {
+                int byte_idx = __builtin_ctzll(hi64) >> 3;
+                uint8_t bucket_mask = (hi64 >> (byte_idx * 8)) & 0xFF;
+
+                size_t pos = i + 8 + byte_idx;
+                int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
+                if (pat_idx >= 0) {
+                    if (out_pos) *out_pos = pos;
+                    if (out_pattern_idx) *out_pattern_idx = (size_t)pat_idx;
+                    return true;
+                }
+                hi64 &= ~(0xFFULL << (byte_idx * 8));
             }
         }
 
@@ -377,33 +421,51 @@ static size_t teddy_multi_count_lines_neon(const TeddyMulti *t, const uint8_t *h
         uint8x16_t cand1 = vandq_u8(res1_lo, res1_hi);
         uint8x16_t candidates = vandq_u8(cand0, cand1);
 
-        // Quick check if any candidates
-        uint64x2_t as_u64 = vreinterpretq_u64_u8(candidates);
-        uint64_t lo64 = vgetq_lane_u64(as_u64, 0);
-        uint64_t hi64 = vgetq_lane_u64(as_u64, 1);
+        // Fast check: any candidates at all?
+        uint8_t max_val = vmaxvq_u8(candidates);
+        if (max_val != 0) {
+            // Use lane extraction instead of memory store
+            uint64x2_t as_u64 = vreinterpretq_u64_u8(candidates);
+            uint64_t lo64 = vgetq_lane_u64(as_u64, 0);
+            uint64_t hi64 = vgetq_lane_u64(as_u64, 1);
 
-        if (lo64 | hi64) {
-            uint8_t cand_bytes[16];
-            vst1q_u8(cand_bytes, candidates);
+            // Process low 8 bytes
+            while (lo64) {
+                int byte_idx = __builtin_ctzll(lo64) >> 3;
+                uint8_t bucket_mask = (lo64 >> (byte_idx * 8)) & 0xFF;
 
-            for (int j = 0; j < 16; j++) {
-                uint8_t bucket_mask = cand_bytes[j];
-                if (bucket_mask == 0) continue;
-
-                size_t pos = i + j;
+                size_t pos = i + byte_idx;
 
                 // Skip if already on a counted line
-                if (last_line_end != SIZE_MAX && pos <= last_line_end) {
-                    continue;
+                if (last_line_end == SIZE_MAX || pos > last_line_end) {
+                    int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
+                    if (pat_idx >= 0) {
+                        lines++;
+                        // Find end of this line
+                        const uint8_t *nl = memchr(hay + pos, '\n', len - pos);
+                        last_line_end = nl ? (size_t)(nl - hay) : len;
+                    }
                 }
+                lo64 &= ~(0xFFULL << (byte_idx * 8));
+            }
 
-                int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
-                if (pat_idx >= 0) {
-                    lines++;
-                    // Find end of this line
-                    const uint8_t *nl = memchr(hay + pos, '\n', len - pos);
-                    last_line_end = nl ? (size_t)(nl - hay) : len;
+            // Process high 8 bytes
+            while (hi64) {
+                int byte_idx = __builtin_ctzll(hi64) >> 3;
+                uint8_t bucket_mask = (hi64 >> (byte_idx * 8)) & 0xFF;
+
+                size_t pos = i + 8 + byte_idx;
+
+                // Skip if already on a counted line
+                if (last_line_end == SIZE_MAX || pos > last_line_end) {
+                    int pat_idx = verify_candidate(t, hay, len, pos, bucket_mask);
+                    if (pat_idx >= 0) {
+                        lines++;
+                        const uint8_t *nl = memchr(hay + pos, '\n', len - pos);
+                        last_line_end = nl ? (size_t)(nl - hay) : len;
+                    }
                 }
+                hi64 &= ~(0xFFULL << (byte_idx * 8));
             }
         }
 

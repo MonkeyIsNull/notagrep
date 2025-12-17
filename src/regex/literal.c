@@ -570,3 +570,332 @@ void inner_literal_info_free(InnerLiteralInfo *info) {
         info->bytes = NULL;
     }
 }
+
+// =============================================================================
+// All-literals extraction (for patterns like prefix.*suffix)
+// =============================================================================
+
+// Context for collecting all literals from an AST
+typedef struct {
+    uint8_t *buf;
+    size_t len;
+    size_t capacity;
+} LiteralBuf;
+
+static void litbuf_init(LiteralBuf *b) {
+    b->buf = malloc(64);
+    b->len = 0;
+    b->capacity = 64;
+}
+
+static void litbuf_free(LiteralBuf *b) {
+    free(b->buf);
+    b->buf = NULL;
+    b->len = 0;
+}
+
+static void litbuf_append(LiteralBuf *b, uint8_t byte) {
+    if (b->len >= b->capacity) {
+        size_t new_cap = b->capacity * 2;
+        uint8_t *new_buf = realloc(b->buf, new_cap);
+        if (!new_buf) return;
+        b->buf = new_buf;
+        b->capacity = new_cap;
+    }
+    b->buf[b->len++] = byte;
+}
+
+static void litbuf_clear(LiteralBuf *b) {
+    b->len = 0;
+}
+
+// Recursively collect all required literals from an AST
+// Saves literal sequences separated by non-literals (.*, ., +, etc.)
+static void collect_all_literals(const AstNode *node, LiteralBuf *current, AllLiteralsInfo *info) {
+    if (!node || info->count >= MAX_ALT_LITERALS) return;
+
+    switch (node->type) {
+        case AST_LITERAL:
+            litbuf_append(current, node->data.literal);
+            break;
+
+        case AST_CONCAT:
+            for (size_t i = 0; i < node->data.list.count; i++) {
+                collect_all_literals(node->data.list.children[i], current, info);
+            }
+            break;
+
+        case AST_GROUP:
+            collect_all_literals(node->data.child, current, info);
+            break;
+
+        case AST_PLUS:
+            // At least one occurrence - extract from child, then save
+            collect_all_literals(node->data.child, current, info);
+            // Save current literal if any
+            if (current->len >= MIN_LITERAL_LEN && info->count < MAX_ALT_LITERALS) {
+                info->literals[info->count] = malloc(current->len);
+                if (info->literals[info->count]) {
+                    memcpy(info->literals[info->count], current->buf, current->len);
+                    info->lens[info->count] = current->len;
+                    info->count++;
+                }
+            }
+            litbuf_clear(current);
+            break;
+
+        case AST_REPEAT:
+            if (node->data.repeat.min > 0) {
+                // At least min copies are required
+                collect_all_literals(node->data.repeat.child, current, info);
+            }
+            // Save current literal if any
+            if (current->len >= MIN_LITERAL_LEN && info->count < MAX_ALT_LITERALS) {
+                info->literals[info->count] = malloc(current->len);
+                if (info->literals[info->count]) {
+                    memcpy(info->literals[info->count], current->buf, current->len);
+                    info->lens[info->count] = current->len;
+                    info->count++;
+                }
+            }
+            litbuf_clear(current);
+            break;
+
+        case AST_STAR:
+        case AST_QUEST:
+        case AST_DOT:
+        case AST_CLASS:
+            // These break the literal sequence
+            // Save current literal if any
+            if (current->len >= MIN_LITERAL_LEN && info->count < MAX_ALT_LITERALS) {
+                info->literals[info->count] = malloc(current->len);
+                if (info->literals[info->count]) {
+                    memcpy(info->literals[info->count], current->buf, current->len);
+                    info->lens[info->count] = current->len;
+                    info->count++;
+                }
+            }
+            litbuf_clear(current);
+            break;
+
+        case AST_ALT:
+            // For alternation, save current literal if any, then process branches
+            if (current->len >= MIN_LITERAL_LEN && info->count < MAX_ALT_LITERALS) {
+                info->literals[info->count] = malloc(current->len);
+                if (info->literals[info->count]) {
+                    memcpy(info->literals[info->count], current->buf, current->len);
+                    info->lens[info->count] = current->len;
+                    info->count++;
+                }
+            }
+            litbuf_clear(current);
+            // Collect from each branch
+            for (size_t i = 0; i < node->data.list.count; i++) {
+                collect_all_literals(node->data.list.children[i], current, info);
+                // Save any literal from this branch
+                if (current->len >= MIN_LITERAL_LEN && info->count < MAX_ALT_LITERALS) {
+                    info->literals[info->count] = malloc(current->len);
+                    if (info->literals[info->count]) {
+                        memcpy(info->literals[info->count], current->buf, current->len);
+                        info->lens[info->count] = current->len;
+                        info->count++;
+                    }
+                }
+                litbuf_clear(current);
+            }
+            break;
+
+        case AST_ANCHOR_START:
+        case AST_ANCHOR_END:
+        case AST_EMPTY:
+            // Don't affect literal collection
+            break;
+    }
+}
+
+bool all_literals_extract(const AstNode *ast, AllLiteralsInfo *info) {
+    memset(info, 0, sizeof(*info));
+    if (!ast) return false;
+
+    LiteralBuf current;
+    litbuf_init(&current);
+
+    collect_all_literals(ast, &current, info);
+
+    // Save any remaining literal
+    if (current.len >= MIN_LITERAL_LEN && info->count < MAX_ALT_LITERALS) {
+        info->literals[info->count] = malloc(current.len);
+        if (info->literals[info->count]) {
+            memcpy(info->literals[info->count], current.buf, current.len);
+            info->lens[info->count] = current.len;
+            info->count++;
+        }
+    }
+
+    litbuf_free(&current);
+
+    // Need at least 2 literals to be useful (otherwise single-literal is sufficient)
+    if (info->count < 2) {
+        all_literals_info_free(info);
+        return false;
+    }
+
+    return true;
+}
+
+void all_literals_info_free(AllLiteralsInfo *info) {
+    for (size_t i = 0; i < info->count; i++) {
+        free(info->literals[i]);
+        info->literals[i] = NULL;
+    }
+    info->count = 0;
+}
+
+// =============================================================================
+// Pure inner literal detection
+// =============================================================================
+
+// Check if a character class is "all-but-newline" (how . is parsed in line mode)
+static bool is_dot_class(const AstNode *node) {
+    if (!node) return false;
+    if (node->type == AST_DOT) return true;
+
+    // In line mode, . is parsed as a character class with all bits set except newline
+    if (node->type == AST_CLASS && node->data.char_class) {
+        const CharClass *cc = node->data.char_class;
+        if (cc->negated) return false;  // Negated classes are different
+
+        // Check if all bytes except newline are set
+        for (int i = 0; i < 256; i++) {
+            bool set = charclass_test(cc, (uint8_t)i);
+            if (i == '\n') {
+                if (set) return false;  // Newline should NOT be set for dot
+            } else {
+                if (!set) return false;  // All other bytes should be set
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// Check if a node is .* or .+
+static bool is_dot_star_or_plus(const AstNode *node) {
+    if (!node) return false;
+    if (node->type == AST_STAR || node->type == AST_PLUS) {
+        const AstNode *child = node->data.child;
+        return is_dot_class(child);
+    }
+    return false;
+}
+
+// Check if a node is just literals (returns the literal count)
+// Also extracts the literal bytes if buf is non-NULL
+static bool is_pure_literal_sequence(const AstNode *node, uint8_t *buf, size_t *len, size_t max_len) {
+    if (!node) return false;
+
+    switch (node->type) {
+        case AST_LITERAL:
+            if (buf && *len < max_len) {
+                buf[*len] = node->data.literal;
+            }
+            (*len)++;
+            return true;
+
+        case AST_CONCAT:
+            for (size_t i = 0; i < node->data.list.count; i++) {
+                if (!is_pure_literal_sequence(node->data.list.children[i], buf, len, max_len)) {
+                    return false;
+                }
+            }
+            return true;
+
+        case AST_GROUP:
+            return is_pure_literal_sequence(node->data.child, buf, len, max_len);
+
+        case AST_EMPTY:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+bool is_pure_inner_literal(const AstNode *ast, uint8_t **lit, size_t *out_len) {
+    if (!ast) return false;
+
+    // Unwrap top-level groups
+    const AstNode *node = ast;
+    while (node->type == AST_GROUP) {
+        node = node->data.child;
+        if (!node) return false;
+    }
+
+    // Case 1: Just a literal or literal sequence (no .*)
+    // E.g., "function" or "func"
+    size_t len = 0;
+    if (is_pure_literal_sequence(node, NULL, &len, 0) && len >= MIN_LITERAL_LEN) {
+        if (lit && out_len) {
+            *lit = malloc(len);
+            if (!*lit) return false;
+            size_t dummy = 0;
+            is_pure_literal_sequence(node, *lit, &dummy, len);
+            *out_len = len;
+        }
+        return true;
+    }
+
+    // Case 2: CONCAT with optional leading .* and/or trailing .*
+    // E.g., ".*function.*" or ".*function" or "function.*"
+    if (node->type != AST_CONCAT) {
+        return false;
+    }
+
+    size_t count = node->data.list.count;
+    if (count == 0) return false;
+
+    // Find the literal portion (skip leading .* and trailing .*)
+    size_t start = 0;
+    size_t end = count;
+
+    // Skip leading .* or .+
+    while (start < end && is_dot_star_or_plus(node->data.list.children[start])) {
+        start++;
+    }
+
+    // Skip trailing .* or .+
+    while (end > start && is_dot_star_or_plus(node->data.list.children[end - 1])) {
+        end--;
+    }
+
+    // Must have something in the middle
+    if (start >= end) {
+        return false;
+    }
+
+    // Everything between start and end must be pure literals
+    len = 0;
+    for (size_t i = start; i < end; i++) {
+        if (!is_pure_literal_sequence(node->data.list.children[i], NULL, &len, 0)) {
+            return false;  // Found non-literal (anchor, class, alt, etc.)
+        }
+    }
+
+    // Must have at least MIN_LITERAL_LEN bytes
+    if (len < MIN_LITERAL_LEN) {
+        return false;
+    }
+
+    // Extract the literal if requested
+    if (lit && out_len) {
+        *lit = malloc(len);
+        if (!*lit) return false;
+        size_t pos = 0;
+        for (size_t i = start; i < end; i++) {
+            is_pure_literal_sequence(node->data.list.children[i], *lit, &pos, len);
+        }
+        *out_len = len;
+    }
+
+    return true;
+}

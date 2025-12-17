@@ -1,6 +1,6 @@
 # notagrep
 
-![notagrep cat](notagrep_cat.jpg)
+<img src="cat.jpg" alt="log" width="80%" />
 
 > "Никакого кофе в мире не хватит, чтобы ускорить grep"
 
