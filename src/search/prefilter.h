@@ -96,6 +96,14 @@ size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_
 size_t prefilter_print_lines(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
                               FILE *out);
 
+// Print all unique lines containing the needle with filename prefix
+// Uses batched I/O for high performance output
+// Format: "filename:line_content\n"
+// Returns number of unique lines printed
+size_t prefilter_print_lines_with_filename(const Prefilter *pf, const uint8_t *haystack,
+                                            size_t haystack_len, const char *filename,
+                                            FILE *out);
+
 // =============================================================================
 // Multi-literal prefilter (for alternation patterns)
 // Uses TeddyMulti SIMD for small pattern sets (2-8 patterns)

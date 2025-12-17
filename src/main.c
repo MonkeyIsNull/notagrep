@@ -176,10 +176,16 @@ static bool search_file_worker(const char *path, ThreadContext *tctx) {
                 // Directly update printer state for count mode (bypass callback overhead)
                 printer.lines_matched = lines;
             }
-        } else if (!global->out_cfg->show_filename && !global->out_cfg->show_line_numbers && !global->pool) {
-            // Fast path: integrated SIMD search + line output (no callback overhead)
+        } else if (!global->out_cfg->show_line_numbers && !global->pool) {
+            // Fast path: integrated SIMD search + batched line output (no callback overhead)
             // Only used in single-threaded mode to avoid output interleaving
-            size_t lines = prefilter_print_lines(global->pattern->prefilter, fb->data, fb->size, stdout);
+            size_t lines;
+            if (global->out_cfg->show_filename) {
+                lines = prefilter_print_lines_with_filename(global->pattern->prefilter,
+                                                            fb->data, fb->size, path, stdout);
+            } else {
+                lines = prefilter_print_lines(global->pattern->prefilter, fb->data, fb->size, stdout);
+            }
             if (lines > 0) {
                 mctx.found_any = true;
                 printer.lines_matched = lines;
