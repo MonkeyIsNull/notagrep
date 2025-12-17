@@ -1,4 +1,5 @@
 #include "regex.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -638,4 +639,170 @@ bool regex_contains_ts(CompiledRegex *re, ExecContext *ctx,
     }
 
     return nfa_contains(re->nfa, ctx, input, input_len);
+}
+
+// Count unique lines with matches (optimized for -c mode)
+size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
+                            const uint8_t *input, size_t input_len) {
+    // Fast path: exact single literal - use optimized SIMD count
+    if (re->has_prefilter && re->prefilter_is_exact) {
+        return prefilter_count_lines(&re->prefilter, input, input_len);
+    }
+
+    // Fast path: exact alternation of literals - use AC with line dedup
+    if (re->has_multi_prefilter && re->multi_prefilter_is_exact) {
+        return multi_prefilter_count_lines(&re->multi_prefilter, input, input_len);
+    }
+
+    // Fast path: inner literal for .*X.* patterns
+    // If the pattern is JUST .*literal.*, then any line containing literal matches
+    if (re->has_inner_prefilter) {
+        // TODO: Detect pure .*X.* patterns and skip NFA entirely
+        // For now, use inner literal prefilter with NFA verification
+        size_t lines = 0;
+        size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match is counted
+        size_t pos = 0;
+
+        while (pos < input_len) {
+            ssize_t lit_pos = prefilter_find_first(&re->inner_prefilter,
+                                                    input + pos, input_len - pos);
+            if (lit_pos < 0) break;
+
+            size_t candidate = pos + (size_t)lit_pos;
+
+            // Skip if we already counted this line
+            if (last_line_end != SIZE_MAX && candidate <= last_line_end) {
+                pos = candidate + 1;
+                continue;
+            }
+
+            // For inner prefilter, start NFA at line start
+            size_t line_start = candidate;
+            while (line_start > 0 && input[line_start - 1] != '\n') {
+                line_start--;
+            }
+
+            // Skip if line already counted
+            if (last_line_end != SIZE_MAX && line_start <= last_line_end) {
+                pos = candidate + 1;
+                continue;
+            }
+
+            // Verify with NFA
+            Match m;
+            if (nfa_match_at(re->nfa, ctx, input, input_len, line_start, &m)) {
+                lines++;
+                // Find end of line
+                const uint8_t *nl = memchr(input + candidate, '\n', input_len - candidate);
+                last_line_end = nl ? (size_t)(nl - input) : input_len;
+            }
+
+            pos = candidate + 1;
+        }
+        return lines;
+    }
+
+    // Prefix prefilter + NFA with line counting
+    if (re->has_prefilter) {
+        size_t lines = 0;
+        size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match is counted
+        size_t pos = 0;
+
+        while (pos < input_len) {
+            ssize_t lit_pos = prefilter_find_first(&re->prefilter,
+                                                    input + pos, input_len - pos);
+            if (lit_pos < 0) break;
+
+            size_t candidate = pos + (size_t)lit_pos;
+
+            // Skip if we already counted this line
+            if (last_line_end != SIZE_MAX && candidate <= last_line_end) {
+                pos = candidate + 1;
+                continue;
+            }
+
+            // Verify with NFA
+            Match m;
+            if (nfa_match_at(re->nfa, ctx, input, input_len, candidate, &m)) {
+                lines++;
+                // Find end of line
+                const uint8_t *nl = memchr(input + candidate, '\n', input_len - candidate);
+                last_line_end = nl ? (size_t)(nl - input) : input_len;
+            }
+
+            pos = candidate + 1;
+        }
+        return lines;
+    }
+
+    // No prefilter: full NFA search with line counting
+    // For now, fall back to find_all (could optimize with a dedicated NFA line counter)
+    return regex_find_all_ts(re, ctx, input, input_len, NULL, NULL);
+}
+
+// Debug: print regex compilation info
+void regex_debug_print(const CompiledRegex *re, const char *pattern) {
+    fprintf(stderr, "\n=== Regex Debug Info ===\n");
+    fprintf(stderr, "Pattern: %s\n", pattern);
+    fprintf(stderr, "Case insensitive: %s\n", re->case_insensitive ? "yes" : "no");
+    fprintf(stderr, "Anchored start: %s\n", re->anchored_start ? "yes" : "no");
+    fprintf(stderr, "Anchored end: %s\n", re->anchored_end ? "yes" : "no");
+
+    // Prefilter info
+    if (re->has_prefilter) {
+        fprintf(stderr, "\nPrefilter: PREFIX_LITERAL\n");
+        fprintf(stderr, "  Literal: \"");
+        for (size_t i = 0; i < re->prefilter.needle_len; i++) {
+            uint8_t c = re->prefilter.needle[i];
+            if (c >= 32 && c < 127) {
+                fputc(c, stderr);
+            } else {
+                fprintf(stderr, "\\x%02x", c);
+            }
+        }
+        fprintf(stderr, "\" (%zu bytes)\n", re->prefilter.needle_len);
+        fprintf(stderr, "  Is exact: %s\n", re->prefilter_is_exact ? "YES (no NFA needed)" : "no");
+    } else if (re->has_multi_prefilter) {
+        fprintf(stderr, "\nPrefilter: MULTI_LITERAL (alternation)\n");
+        fprintf(stderr, "  Pattern count: %zu\n", re->multi_prefilter.count);
+        fprintf(stderr, "  Uses Aho-Corasick: %s\n", re->multi_prefilter.use_ac ? "yes" : "no");
+        fprintf(stderr, "  Is exact: %s\n", re->multi_prefilter_is_exact ? "YES (no NFA needed)" : "no");
+        for (size_t i = 0; i < re->multi_prefilter.count && i < 8; i++) {
+            fprintf(stderr, "  [%zu] \"", i);
+            for (size_t j = 0; j < re->multi_prefilter.filters[i].needle_len; j++) {
+                uint8_t c = re->multi_prefilter.filters[i].needle[j];
+                if (c >= 32 && c < 127) {
+                    fputc(c, stderr);
+                } else {
+                    fprintf(stderr, "\\x%02x", c);
+                }
+            }
+            fprintf(stderr, "\" (%zu bytes)\n", re->multi_prefilter.filters[i].needle_len);
+        }
+    } else if (re->has_inner_prefilter) {
+        fprintf(stderr, "\nPrefilter: INNER_LITERAL (for .*X.* patterns)\n");
+        fprintf(stderr, "  Literal: \"");
+        for (size_t i = 0; i < re->inner_prefilter.needle_len; i++) {
+            uint8_t c = re->inner_prefilter.needle[i];
+            if (c >= 32 && c < 127) {
+                fputc(c, stderr);
+            } else {
+                fprintf(stderr, "\\x%02x", c);
+            }
+        }
+        fprintf(stderr, "\" (%zu bytes)\n", re->inner_prefilter.needle_len);
+    } else if (re->has_required_byte) {
+        fprintf(stderr, "\nPrefilter: REQUIRED_BYTE (fallback)\n");
+        fprintf(stderr, "  Byte: 0x%02x", re->required_byte);
+        if (re->required_byte >= 32 && re->required_byte < 127) {
+            fprintf(stderr, " ('%c')", re->required_byte);
+        }
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "\nPrefilter: NONE (full NFA scan)\n");
+    }
+
+    // NFA info
+    fprintf(stderr, "\nNFA states: %zu\n", re->nfa->count);
+    fprintf(stderr, "========================\n\n");
 }

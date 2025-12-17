@@ -87,4 +87,12 @@ size_t regex_find_all_ts(CompiledRegex *re, ExecContext *ctx,
 bool regex_contains_ts(CompiledRegex *re, ExecContext *ctx,
                        const uint8_t *input, size_t input_len);
 
+// Count unique lines with matches (for -c mode, thread-safe)
+// This is optimized for count mode - avoids callback overhead
+size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
+                            const uint8_t *input, size_t input_len);
+
+// Debug: print regex compilation info to stderr
+void regex_debug_print(const CompiledRegex *re, const char *pattern);
+
 #endif // NOTAGREP_REGEX_H

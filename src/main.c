@@ -145,6 +145,14 @@ static bool search_file_worker(const char *path, ThreadContext *tctx) {
             if (regex_contains_ts(global->pattern->regex, ctx, fb->data, fb->size)) {
                 mctx.found_any = true;
             }
+        } else if (global->cfg->count_only) {
+            // Optimized path for regex count mode
+            size_t lines = regex_count_lines_ts(global->pattern->regex, ctx,
+                                                fb->data, fb->size);
+            if (lines > 0) {
+                mctx.found_any = true;
+                printer.lines_matched = lines;
+            }
         } else {
             regex_find_all_ts(global->pattern->regex, ctx, fb->data, fb->size,
                               regex_match_handler, &mctx);
@@ -278,6 +286,11 @@ int main(int argc, char **argv) {
                     err.position, parse_error_message(&err));
             config_free(&cfg);
             return 1;
+        }
+
+        // Debug output if requested
+        if (cfg.debug_regex) {
+            regex_debug_print(pat.regex, cfg.pattern);
         }
     }
 

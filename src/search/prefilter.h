@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include "teddy.h"
+#include "teddy_multi.h"
 #include "packed_pair.h"
 
 // Minimum needle length for SIMD to be beneficial
@@ -90,7 +91,8 @@ size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_
 
 // =============================================================================
 // Multi-literal prefilter (for alternation patterns)
-// Uses Aho-Corasick for O(n) multi-pattern matching
+// Uses TeddyMulti SIMD for small pattern sets (2-8 patterns)
+// Falls back to Aho-Corasick for larger sets or when SIMD unavailable
 // =============================================================================
 
 #define MULTI_PREFILTER_MAX 16
@@ -99,12 +101,21 @@ size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_
 struct AhoCorasick;
 
 typedef struct {
-    struct AhoCorasick *ac;        // Aho-Corasick automaton (primary)
-    Prefilter filters[MULTI_PREFILTER_MAX];  // Fallback for single pattern
+    // Primary: TeddyMulti SIMD for 2-8 patterns (fastest)
+    TeddyMulti teddy_multi;
+    bool use_teddy_multi;          // True if using TeddyMulti SIMD
+
+    // Fallback: Aho-Corasick for >8 patterns or case-insensitive
+    struct AhoCorasick *ac;        // Aho-Corasick automaton
+    bool use_ac;                   // True if using Aho-Corasick
+
+    // Single pattern fallback
+    Prefilter filters[MULTI_PREFILTER_MAX];
+
+    // Pattern metadata
     size_t *pattern_lens;          // Pattern lengths for match reporting
     size_t count;
     bool case_insensitive;
-    bool use_ac;                   // True if using Aho-Corasick
 } MultiPrefilter;
 
 // Initialize multi-prefilter with multiple literals
@@ -132,6 +143,10 @@ int multi_prefilter_search(const MultiPrefilter *mpf,
 // Check if any needle exists in haystack
 bool multi_prefilter_contains(const MultiPrefilter *mpf,
                               const uint8_t *haystack, size_t haystack_len);
+
+// Count unique lines containing any needle (for -c mode)
+size_t multi_prefilter_count_lines(const MultiPrefilter *mpf,
+                                    const uint8_t *haystack, size_t haystack_len);
 
 // =============================================================================
 // Single-byte scanner (for required byte fallback)

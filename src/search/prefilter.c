@@ -700,14 +700,14 @@ static size_t count_lines_simd_packed_pair(const Prefilter *pf, const uint8_t *h
     if (pf->needle_len < 2) {
         // Fallback for single-byte patterns
         size_t lines = 0;
-        size_t last_line_end = 0;
+        size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match at pos 0 is counted
         const uint8_t *p = haystack;
         const uint8_t *end = haystack + haystack_len;
         while (p < end) {
             p = memchr(p, pf->needle[0], end - p);
             if (!p) break;
             size_t pos = p - haystack;
-            if (pos > last_line_end) {
+            if (last_line_end == SIZE_MAX || pos > last_line_end) {
                 lines++;
                 const uint8_t *nl = memchr(p, '\n', end - p);
                 last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
@@ -720,7 +720,7 @@ static size_t count_lines_simd_packed_pair(const Prefilter *pf, const uint8_t *h
     size_t lines = 0;
     const uint8_t *p = haystack;
     const uint8_t *end = haystack + haystack_len - pf->needle_len + 1;
-    size_t last_line_end = 0;
+    size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match at pos 0 is counted
 
     const size_t idx1 = pf->rare1_offset;
     const size_t idx2 = pf->rare2_offset;
@@ -750,7 +750,7 @@ static size_t count_lines_simd_packed_pair(const Prefilter *pf, const uint8_t *h
                 while (i < needle_len && candidate[i] == needle[i]) i++;
                 if (i == needle_len) {
                     size_t pos = candidate - haystack;
-                    if (pos > last_line_end) {
+                    if (last_line_end == SIZE_MAX || pos > last_line_end) {
                         lines++;
                         // Find end of line using memchr (fast)
                         const uint8_t *nl = memchr(candidate, '\n', haystack + haystack_len - candidate);
@@ -770,7 +770,7 @@ static size_t count_lines_simd_packed_pair(const Prefilter *pf, const uint8_t *h
             while (i < needle_len && p[i] == needle[i]) i++;
             if (i == needle_len) {
                 size_t pos = p - haystack;
-                if (pos > last_line_end) {
+                if (last_line_end == SIZE_MAX || pos > last_line_end) {
                     lines++;
                     const uint8_t *nl = memchr(p, '\n', haystack + haystack_len - p);
                     last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
@@ -794,7 +794,7 @@ size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_
 
     // Fallback: use regular search with inline line counting
     size_t lines = 0;
-    size_t last_line_end = 0;
+    size_t last_line_end = SIZE_MAX;  // Initialize to SIZE_MAX so first match at pos 0 is counted
 
     // Use the existing prefilter_search infrastructure but count locally
     const uint8_t *p = haystack;
@@ -805,7 +805,9 @@ size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_
         if (found < 0) break;
 
         size_t pos = (p - haystack) + found;
-        if (pos > last_line_end) {
+        // Count this line if it's after the last line we counted
+        // (or if this is the first match, when last_line_end == SIZE_MAX)
+        if (last_line_end == SIZE_MAX || pos > last_line_end) {
             lines++;
             const uint8_t *nl = memchr(haystack + pos, '\n', haystack_len - pos);
             last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
@@ -832,6 +834,7 @@ int multi_prefilter_init(MultiPrefilter *mpf,
     mpf->case_insensitive = case_insensitive;
     mpf->count = count;
     mpf->use_ac = false;
+    mpf->use_teddy_multi = false;
     mpf->ac = NULL;
     mpf->pattern_lens = NULL;
 
@@ -843,23 +846,46 @@ int multi_prefilter_init(MultiPrefilter *mpf,
         return 0;
     }
 
-    // For multiple patterns, use Aho-Corasick for O(n) matching
-    mpf->ac = ac_create(case_insensitive);
-    if (!mpf->ac) {
-        return -1;
-    }
-
     // Store pattern lengths for match reporting
     mpf->pattern_lens = malloc(count * sizeof(size_t));
     if (!mpf->pattern_lens) {
-        ac_free(mpf->ac);
-        mpf->ac = NULL;
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        mpf->pattern_lens[i] = lens[i];
+    }
+
+    // Try TeddyMulti SIMD for small pattern sets (2-8 patterns, case-sensitive)
+    // TeddyMulti requires all patterns to be at least 2 bytes
+    bool can_use_teddy = (count <= TEDDY_MULTI_MAX_PATTERNS) && !case_insensitive;
+    if (can_use_teddy) {
+        for (size_t i = 0; i < count; i++) {
+            if (lens[i] < 2) {
+                can_use_teddy = false;
+                break;
+            }
+        }
+    }
+
+    if (can_use_teddy && teddy_multi_available()) {
+        if (teddy_multi_init(&mpf->teddy_multi, (const uint8_t **)needles, lens,
+                             count, case_insensitive) == 0) {
+            mpf->use_teddy_multi = true;
+            return 0;
+        }
+        // Fall through to Aho-Corasick if TeddyMulti fails
+    }
+
+    // Fall back to Aho-Corasick for larger pattern sets or case-insensitive
+    mpf->ac = ac_create(case_insensitive);
+    if (!mpf->ac) {
+        free(mpf->pattern_lens);
+        mpf->pattern_lens = NULL;
         return -1;
     }
 
     // Add all patterns to the automaton
     for (size_t i = 0; i < count; i++) {
-        mpf->pattern_lens[i] = lens[i];
         if (ac_add_pattern(mpf->ac, needles[i], lens[i], (int)i) < 0) {
             ac_free(mpf->ac);
             free(mpf->pattern_lens);
@@ -883,7 +909,13 @@ int multi_prefilter_init(MultiPrefilter *mpf,
 }
 
 void multi_prefilter_free(MultiPrefilter *mpf) {
-    if (mpf->use_ac) {
+    if (mpf->use_teddy_multi) {
+        teddy_multi_free(&mpf->teddy_multi);
+        if (mpf->pattern_lens) {
+            free(mpf->pattern_lens);
+            mpf->pattern_lens = NULL;
+        }
+    } else if (mpf->use_ac) {
         // Free Aho-Corasick automaton
         if (mpf->ac) {
             ac_free(mpf->ac);
@@ -901,6 +933,7 @@ void multi_prefilter_free(MultiPrefilter *mpf) {
     }
     mpf->count = 0;
     mpf->use_ac = false;
+    mpf->use_teddy_multi = false;
 }
 
 // Context for collecting matches from Aho-Corasick
@@ -946,6 +979,27 @@ static void single_match_wrapper(size_t pos, void *ctx) {
     sctx->count++;
 }
 
+// Context for TeddyMulti search
+typedef struct {
+    multi_match_cb user_cb;
+    void *user_data;
+    int count;
+} TeddyMultiSearchCtx;
+
+// Callback adapter from TeddyMulti format to MultiMatch format
+static void teddy_multi_match_adapter(const TeddyMultiMatch *tm, void *ctx) {
+    TeddyMultiSearchCtx *tctx = (TeddyMultiSearchCtx *)ctx;
+    MultiMatch m = {
+        .pos = tm->pos,
+        .len = tm->pattern_len,
+        .which = tm->pattern_idx
+    };
+    if (tctx->user_cb) {
+        tctx->user_cb(&m, tctx->user_data);
+    }
+    tctx->count++;
+}
+
 int multi_prefilter_search(const MultiPrefilter *mpf,
                            const uint8_t *haystack, size_t haystack_len,
                            multi_match_cb cb, void *ctx) {
@@ -953,7 +1007,17 @@ int multi_prefilter_search(const MultiPrefilter *mpf,
         return -1;
     }
 
-    if (mpf->use_ac) {
+    if (mpf->use_teddy_multi) {
+        // Use TeddyMulti SIMD for fast multi-pattern matching
+        TeddyMultiSearchCtx tctx = {
+            .user_cb = cb,
+            .user_data = ctx,
+            .count = 0
+        };
+        teddy_multi_search(&mpf->teddy_multi, haystack, haystack_len,
+                          teddy_multi_match_adapter, &tctx);
+        return tctx.count;
+    } else if (mpf->use_ac) {
         // Use Aho-Corasick for O(n) multi-pattern matching
         ACSearchCtx actx = {
             .user_cb = cb,
@@ -983,12 +1047,66 @@ bool multi_prefilter_contains(const MultiPrefilter *mpf,
         return false;
     }
 
-    if (mpf->use_ac) {
+    if (mpf->use_teddy_multi) {
+        // Use TeddyMulti SIMD for fast check
+        return teddy_multi_contains(&mpf->teddy_multi, haystack, haystack_len);
+    } else if (mpf->use_ac) {
         // Use Aho-Corasick for O(n) check
         return ac_contains(mpf->ac, haystack, haystack_len);
     } else {
         // Single pattern: use regular prefilter
         return prefilter_contains(&mpf->filters[0], haystack, haystack_len);
+    }
+}
+
+// Context for AC line counting
+typedef struct {
+    const uint8_t *haystack;
+    size_t haystack_len;
+    size_t lines;
+    size_t last_line_end;
+} ACLineCountCtx;
+
+static void ac_line_count_cb(size_t pos, size_t len, int pattern_id, void *ctx) {
+    (void)len;
+    (void)pattern_id;
+    ACLineCountCtx *lctx = (ACLineCountCtx *)ctx;
+
+    // Skip if we already counted this line
+    // last_line_end is initialized to SIZE_MAX, so first match is always counted
+    if (lctx->last_line_end != SIZE_MAX && pos <= lctx->last_line_end) {
+        return;
+    }
+
+    lctx->lines++;
+    // Find end of this line
+    const uint8_t *nl = memchr(lctx->haystack + pos, '\n', lctx->haystack_len - pos);
+    lctx->last_line_end = nl ? (size_t)(nl - lctx->haystack) : lctx->haystack_len;
+}
+
+size_t multi_prefilter_count_lines(const MultiPrefilter *mpf,
+                                    const uint8_t *haystack, size_t haystack_len) {
+    if (!mpf || mpf->count == 0) {
+        return 0;
+    }
+
+    if (mpf->use_teddy_multi) {
+        // Use TeddyMulti SIMD with integrated line counting
+        return teddy_multi_count_lines(&mpf->teddy_multi, haystack, haystack_len);
+    } else if (mpf->use_ac) {
+        // Use Aho-Corasick with line deduplication
+        // Initialize last_line_end to SIZE_MAX so first match at pos 0 is counted
+        ACLineCountCtx ctx = {
+            .haystack = haystack,
+            .haystack_len = haystack_len,
+            .lines = 0,
+            .last_line_end = SIZE_MAX
+        };
+        ac_search(mpf->ac, haystack, haystack_len, ac_line_count_cb, &ctx);
+        return ctx.lines;
+    } else {
+        // Single pattern: use regular prefilter_count_lines
+        return prefilter_count_lines(&mpf->filters[0], haystack, haystack_len);
     }
 }
 

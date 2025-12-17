@@ -30,6 +30,7 @@ static const struct option long_options[] = {
     {"max-filesize",  required_argument, NULL, 'M'},
     {"threads",       required_argument, NULL, 'j'},
     {"type",          required_argument, NULL, 't'},
+    {"debug-regex",   no_argument,       NULL, 'R'},
     {"help",          no_argument,       NULL, 'h'},
     {"version",       no_argument,       NULL, 'V'},
     {NULL, 0, NULL, 0}
@@ -130,6 +131,7 @@ int config_parse(Config *cfg, int argc, char **argv) {
             case 'D': cfg->include_hidden = true; break;
             case 'B': cfg->search_binary = true; break;
             case 'b': cfg->bytes_mode = true; break;
+            case 'R': cfg->debug_regex = true; break;
             case 'M': cfg->max_filesize = parse_size(optarg); break;
             case 'j':
                 cfg->thread_count = atoi(optarg);

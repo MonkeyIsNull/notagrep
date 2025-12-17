@@ -30,6 +30,9 @@ typedef struct {
     size_t max_filesize;           // --max-filesize: skip files larger than this (0 = no limit)
     int thread_count;              // --threads: number of threads (0 = auto)
 
+    // Debug flags
+    bool debug_regex;              // --debug-regex: print regex compilation info
+
     // Type filters (NULL-terminated array)
     const char **type_include;     // --type: only search these types
     size_t type_include_count;
