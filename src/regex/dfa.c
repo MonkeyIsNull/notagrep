@@ -380,6 +380,45 @@ static uint32_t dfa_alloc_state(Dfa *dfa) {
     return idx;
 }
 
+// =============================================================================
+// State Acceleration
+// =============================================================================
+
+// Build acceleration info for all states after DFA construction
+// For states where most transitions loop back, we can use memchr to skip ahead
+static void dfa_build_accel(Dfa *dfa) {
+    if (!dfa || dfa->state_count == 0) return;
+
+    dfa->accel = calloc(dfa->state_count, sizeof(DfaStateAccel));
+    if (!dfa->accel) return;
+
+    for (uint32_t state = 0; state < dfa->state_count; state++) {
+        DfaState *s = &dfa->states[state];
+        DfaStateAccel *accel = &dfa->accel[state];
+
+        // Count how many transitions go to a different state
+        uint8_t diff_bytes[256];
+        int diff_count = 0;
+
+        for (int byte = 0; byte < 256; byte++) {
+            if (s->transitions[byte] != state) {
+                // This byte transitions to a different state
+                diff_bytes[diff_count++] = (uint8_t)byte;
+                if (diff_count > DFA_ACCEL_MAX_BYTES) break;
+            }
+        }
+
+        // If 253+ bytes loop back (i.e., <= 3 bytes escape), we can accelerate
+        if (diff_count > 0 && diff_count <= DFA_ACCEL_MAX_BYTES) {
+            accel->count = (uint8_t)diff_count;
+            for (int i = 0; i < diff_count; i++) {
+                accel->bytes[i] = diff_bytes[i];
+            }
+        }
+        // Otherwise accel->count = 0 (not acceleratable)
+    }
+}
+
 Dfa *dfa_compile(const Nfa *nfa, uint32_t max_states) {
     if (!nfa || nfa->count == 0) return NULL;
 
@@ -557,6 +596,9 @@ Dfa *dfa_compile(const Nfa *nfa, uint32_t max_states) {
     stateset_free(start_set);
     dfa->is_complete = true;
 
+    // Build acceleration info for states with few escape bytes
+    dfa_build_accel(dfa);
+
 cleanup:
     stateset_free(current_set);
     stateset_free(next_set);
@@ -575,6 +617,7 @@ cleanup:
 void dfa_free(Dfa *dfa) {
     if (!dfa) return;
     free(dfa->states);
+    free(dfa->accel);
     free(dfa);
 }
 

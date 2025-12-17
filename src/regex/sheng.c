@@ -12,26 +12,17 @@
 #endif
 
 // =============================================================================
-// Sheng DFA Compilation
+// Sheng DFA Compilation (Hyperscan algorithm)
 // =============================================================================
 //
-// Sheng DFA encodes transitions such that for each byte b, we can compute:
-//   next_state = trans[current_state][b]
+// Sheng DFA uses SIMD shuffle for O(1) state transitions.
+// For each input byte b, there's a 16-byte shuffle mask where:
+//   masks[b][state] = next_state for transition (state, b)
 //
-// Since we have at most 16 states (fitting in 4 bits), we can use SIMD shuffle
-// instructions for O(1) lookup. For each input byte b:
-//   1. Use lo_masks[state] to look up via (b & 0xF) -> gets "lo contribution"
-//   2. Use hi_masks[state] to look up via (b >> 4) -> gets "hi contribution"
-//   3. Combine: next_state = (lo_contribution >> (hi * 4)) & 0xF
+// Execution: next_state = shuffle(masks[byte], broadcast(state))[0]
 //
-// However, this decomposition only works for specific transition patterns.
-// Instead, we use a simpler approach: for each state, build a 256-byte table
-// compressed into 16 shuffle masks (one per high nybble). The low nybble
-// selects which byte in the shuffle result to use.
-//
-// Actually, for correctness, we use a direct transition table approach:
-// For each state s and byte b, we store trans[s][b] directly in a format
-// amenable to SIMD. Since state IDs fit in 4 bits, we pack two per byte.
+// This is simple and correct - no nybble decomposition needed.
+// Memory: 256 * 16 = 4KB per DFA
 
 bool sheng_compile(ShengDfa *sheng, const Dfa *dfa) {
     if (!sheng || !dfa) return false;
@@ -46,155 +37,72 @@ bool sheng_compile(ShengDfa *sheng, const Dfa *dfa) {
 
     sheng->state_count = (uint8_t)dfa->state_count;
 
-    // Build direct transition tables
-    // For each state, we have 16 "shuffle masks" - one for each high nybble
-    // Each mask contains 16 entries (one for each low nybble)
-    // The entry contains the next state (0-15, or 0 for dead state)
-
-    for (uint32_t state = 0; state < dfa->state_count; state++) {
-        const DfaState *s = &dfa->states[state];
-
-        // lo_masks[state] = transitions for bytes 0x00-0x0F
-        // This is indexed by the low nybble when high nybble matches state's index
-        // Actually, we need to restructure: lo_masks[state][lo] should give
-        // the next state for byte with low nybble = lo, across all high nybbles
-
-        // For proper Sheng, we store: for state s and byte b (0x00-0xFF):
-        //   trans[s][b] = next_state
-        // We need two lookups to reconstruct this.
-
-        // Correct approach:
-        // masks[state][hi_nybble][lo_nybble] = next_state for byte (hi<<4 | lo)
-        // But we only have lo_masks and hi_masks (16 bytes each per state).
-        //
-        // The trick is: for byte b, we want trans[state][b].
-        // We can use: next = shuffle(masks[state], b & 0xF) - but this only
-        // works if the transition is the same for all bytes with same low nybble.
-        //
-        // Since that's rarely true, Sheng actually uses a different trick:
-        // It stores state in the high bits of a register and uses the byte value
-        // to index into a larger table. For 16 states, this becomes tractable.
-        //
-        // For simplicity, let's use a 256-byte transition table per state
-        // and do a straightforward scalar lookup for now, but structured
-        // for potential SIMD optimization later.
-
-        for (int byte = 0; byte < 256; byte++) {
-            int lo = byte & 0xF;
-            int hi = byte >> 4;
-            uint16_t next = s->transitions[byte];
-
-            // Store the next state (clamp to 0 if dead/out of range)
-            uint8_t next_state = (next < SHENG_MAX_STATES) ? (uint8_t)next : 0;
-
-            // Store in both masks so we can look up either way
-            // lo_masks[state][lo] will have the state for hi=0
-            // hi_masks[state][hi] will have the state for lo=0
-            // This is for the scalar fallback
-            if (hi == 0) {
-                sheng->lo_masks[state][lo] = next_state;
-            }
-            if (lo == 0) {
-                sheng->hi_masks[state][hi] = next_state;
-            }
+    // Build the 256 shuffle masks (one per input byte)
+    // masks[byte][state] = next_state for transition (state, byte)
+    for (int byte = 0; byte < 256; byte++) {
+        for (uint32_t state = 0; state < dfa->state_count; state++) {
+            uint16_t next = dfa->states[state].transitions[byte];
+            // Clamp to 0 (dead state) if next >= 16
+            sheng->masks[byte][state] = (next < SHENG_MAX_STATES) ? (uint8_t)next : 0;
         }
+        // Fill remaining slots with 0 (dead state) for states that don't exist
+        for (uint32_t state = dfa->state_count; state < 16; state++) {
+            sheng->masks[byte][state] = 0;
+        }
+    }
 
-        // Build accept mask
-        if (s->flags & DFA_FLAG_MATCH) {
+    // Build accept mask
+    sheng->accept_mask = 0;
+    for (uint32_t state = 0; state < dfa->state_count; state++) {
+        if (dfa->states[state].flags & DFA_FLAG_MATCH) {
             sheng->accept_mask |= (1 << state);
         }
     }
 
-    // Mark as invalid - the encoding above is still not correct for SIMD
-    // We need to fall back to DFA for now
-    sheng->is_valid = false;
-    return false;
+    sheng->is_valid = true;
+    return true;
 }
 
 // =============================================================================
-// Sheng DFA Execution (Scalar fallback)
-// =============================================================================
-
-// Scalar version for reference and non-SIMD platforms
-static inline uint8_t sheng_transition_scalar(const ShengDfa *sheng,
-                                               uint8_t state, uint8_t byte) {
-    uint8_t lo_nyb = byte & 0x0F;
-    uint8_t hi_nyb = byte >> 4;
-
-    uint8_t lo_bits = sheng->lo_masks[state][lo_nyb];
-    uint8_t hi_bits = sheng->hi_masks[state][hi_nyb];
-    uint8_t possible = lo_bits & hi_bits;
-
-    // Find the single set bit (should be exactly one for valid DFA)
-    // Using CTZ (count trailing zeros) or bit scan
-    if (possible == 0) return 0;  // Dead state
-
-    // Fast path for small state numbers
-    for (uint8_t i = 0; i < 16; i++) {
-        if (possible & (1 << i)) return i;
-    }
-    return 0;
-}
-
-// =============================================================================
-// Sheng DFA Execution (SIMD)
+// Sheng DFA Execution (ARM NEON)
 // =============================================================================
 
 #if defined(SHENG_ARM64)
 
-// ARM NEON implementation
 bool sheng_contains(const ShengDfa *sheng, const uint8_t *input, size_t len) {
     if (!sheng || !sheng->is_valid || len == 0) return false;
 
     uint8_t state = DFA_START_STATE;
 
-    // Check immediate match
+    // Check if start state is accepting
     if (sheng->accept_mask & (1 << state)) {
         return true;
     }
 
-    // Process bytes
-    const uint8_t *p = input;
-    const uint8_t *end = input + len;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t byte = input[i];
 
-    // Main loop using NEON table lookups
-    while (p < end) {
-        uint8_t byte = *p++;
-        uint8_t lo_nyb = byte & 0x0F;
-        uint8_t hi_nyb = byte >> 4;
+        // Load the shuffle mask for this input byte
+        uint8x16_t mask = vld1q_u8(sheng->masks[byte]);
 
-        // Load the masks for current state
-        uint8x16_t lo_mask = vld1q_u8(sheng->lo_masks[state]);
-        uint8x16_t hi_mask = vld1q_u8(sheng->hi_masks[state]);
+        // Broadcast current state to all lanes
+        uint8x16_t state_vec = vdupq_n_u8(state);
 
-        // Use table lookup to get the bits for this nybble
-        uint8x16_t lo_idx = vdupq_n_u8(lo_nyb);
-        uint8x16_t hi_idx = vdupq_n_u8(hi_nyb);
+        // Shuffle: result[i] = mask[state_vec[i]] = mask[state] for all i
+        uint8x16_t result = vqtbl1q_u8(mask, state_vec);
 
-        uint8x16_t lo_result = vqtbl1q_u8(lo_mask, lo_idx);
-        uint8x16_t hi_result = vqtbl1q_u8(hi_mask, hi_idx);
+        // Extract next state from lane 0
+        state = vgetq_lane_u8(result, 0);
 
-        // AND to get possible next states
-        uint8x16_t possible = vandq_u8(lo_result, hi_result);
-        uint8_t possible_byte = vgetq_lane_u8(possible, 0);
-
-        // Find next state (lowest set bit)
-        if (possible_byte == 0) {
-            // Dead state - restart from next position would be needed for unanchored
-            // For contains, we can try from the next position
+        if (state == 0) {
+            // Dead state - restart from start state for unanchored search
             state = DFA_START_STATE;
-
-            // Check if start state is accepting
             if (sheng->accept_mask & (1 << state)) {
                 return true;
             }
             continue;
         }
 
-        // Get next state via CTZ
-        state = __builtin_ctz(possible_byte);
-
-        // Check for match
         if (sheng->accept_mask & (1 << state)) {
             return true;
         }
@@ -211,42 +119,33 @@ bool sheng_match_at(const ShengDfa *sheng, const uint8_t *input, size_t len,
     bool matched = false;
     size_t match_end = start;
 
-    // Check immediate match
+    // Check if start state is accepting
     if (sheng->accept_mask & (1 << state)) {
         matched = true;
         match_end = start;
     }
 
-    const uint8_t *p = input + start;
-    const uint8_t *end = input + len;
+    for (size_t i = start; i < len; i++) {
+        uint8_t byte = input[i];
 
-    while (p < end) {
-        uint8_t byte = *p++;
-        uint8_t lo_nyb = byte & 0x0F;
-        uint8_t hi_nyb = byte >> 4;
+        // Load the shuffle mask for this input byte
+        uint8x16_t mask = vld1q_u8(sheng->masks[byte]);
 
-        // Load masks and do lookup
-        uint8x16_t lo_mask = vld1q_u8(sheng->lo_masks[state]);
-        uint8x16_t hi_mask = vld1q_u8(sheng->hi_masks[state]);
+        // Broadcast current state and shuffle
+        uint8x16_t state_vec = vdupq_n_u8(state);
+        uint8x16_t result = vqtbl1q_u8(mask, state_vec);
 
-        uint8x16_t lo_idx = vdupq_n_u8(lo_nyb);
-        uint8x16_t hi_idx = vdupq_n_u8(hi_nyb);
+        // Extract next state
+        state = vgetq_lane_u8(result, 0);
 
-        uint8x16_t lo_result = vqtbl1q_u8(lo_mask, lo_idx);
-        uint8x16_t hi_result = vqtbl1q_u8(hi_mask, hi_idx);
-
-        uint8x16_t possible = vandq_u8(lo_result, hi_result);
-        uint8_t possible_byte = vgetq_lane_u8(possible, 0);
-
-        if (possible_byte == 0) {
-            break;  // Dead state
+        if (state == 0) {
+            break;  // Dead state - no more matches possible from this position
         }
-
-        state = __builtin_ctz(possible_byte);
 
         if (sheng->accept_mask & (1 << state)) {
             matched = true;
-            match_end = p - input;
+            match_end = i + 1;
+            // Continue to find longest match
         }
     }
 
@@ -258,9 +157,12 @@ bool sheng_match_at(const ShengDfa *sheng, const uint8_t *input, size_t len,
     return matched;
 }
 
+// =============================================================================
+// Sheng DFA Execution (x86-64 SSE/SSSE3)
+// =============================================================================
+
 #elif defined(SHENG_X86_64)
 
-// x86-64 SSE implementation
 bool sheng_contains(const ShengDfa *sheng, const uint8_t *input, size_t len) {
     if (!sheng || !sheng->is_valid || len == 0) return false;
 
@@ -272,30 +174,26 @@ bool sheng_contains(const ShengDfa *sheng, const uint8_t *input, size_t len) {
 
     for (size_t i = 0; i < len; i++) {
         uint8_t byte = input[i];
-        uint8_t lo_nyb = byte & 0x0F;
-        uint8_t hi_nyb = byte >> 4;
 
-        __m128i lo_mask = _mm_loadu_si128((__m128i *)sheng->lo_masks[state]);
-        __m128i hi_mask = _mm_loadu_si128((__m128i *)sheng->hi_masks[state]);
+        // Load the shuffle mask for this input byte
+        __m128i mask = _mm_loadu_si128((__m128i *)sheng->masks[byte]);
 
-        __m128i lo_idx = _mm_set1_epi8(lo_nyb);
-        __m128i hi_idx = _mm_set1_epi8(hi_nyb);
+        // Broadcast current state to all lanes
+        __m128i state_vec = _mm_set1_epi8(state);
 
-        __m128i lo_result = _mm_shuffle_epi8(lo_mask, lo_idx);
-        __m128i hi_result = _mm_shuffle_epi8(hi_mask, hi_idx);
+        // Shuffle using PSHUFB (SSSE3)
+        __m128i result = _mm_shuffle_epi8(mask, state_vec);
 
-        __m128i possible = _mm_and_si128(lo_result, hi_result);
-        uint8_t possible_byte = _mm_extract_epi8(possible, 0);
+        // Extract next state from lane 0
+        state = (uint8_t)_mm_extract_epi8(result, 0);
 
-        if (possible_byte == 0) {
+        if (state == 0) {
             state = DFA_START_STATE;
             if (sheng->accept_mask & (1 << state)) {
                 return true;
             }
             continue;
         }
-
-        state = __builtin_ctz(possible_byte);
 
         if (sheng->accept_mask & (1 << state)) {
             return true;
@@ -320,26 +218,16 @@ bool sheng_match_at(const ShengDfa *sheng, const uint8_t *input, size_t len,
 
     for (size_t i = start; i < len; i++) {
         uint8_t byte = input[i];
-        uint8_t lo_nyb = byte & 0x0F;
-        uint8_t hi_nyb = byte >> 4;
 
-        __m128i lo_mask = _mm_loadu_si128((__m128i *)sheng->lo_masks[state]);
-        __m128i hi_mask = _mm_loadu_si128((__m128i *)sheng->hi_masks[state]);
+        __m128i mask = _mm_loadu_si128((__m128i *)sheng->masks[byte]);
+        __m128i state_vec = _mm_set1_epi8(state);
+        __m128i result = _mm_shuffle_epi8(mask, state_vec);
 
-        __m128i lo_idx = _mm_set1_epi8(lo_nyb);
-        __m128i hi_idx = _mm_set1_epi8(hi_nyb);
+        state = (uint8_t)_mm_extract_epi8(result, 0);
 
-        __m128i lo_result = _mm_shuffle_epi8(lo_mask, lo_idx);
-        __m128i hi_result = _mm_shuffle_epi8(hi_mask, hi_idx);
-
-        __m128i possible = _mm_and_si128(lo_result, hi_result);
-        uint8_t possible_byte = _mm_extract_epi8(possible, 0);
-
-        if (possible_byte == 0) {
+        if (state == 0) {
             break;
         }
-
-        state = __builtin_ctz(possible_byte);
 
         if (sheng->accept_mask & (1 << state)) {
             matched = true;
@@ -355,9 +243,12 @@ bool sheng_match_at(const ShengDfa *sheng, const uint8_t *input, size_t len,
     return matched;
 }
 
+// =============================================================================
+// Sheng DFA Execution (Scalar fallback)
+// =============================================================================
+
 #else
 
-// Scalar fallback for other platforms
 bool sheng_contains(const ShengDfa *sheng, const uint8_t *input, size_t len) {
     if (!sheng || !sheng->is_valid || len == 0) return false;
 
@@ -368,10 +259,12 @@ bool sheng_contains(const ShengDfa *sheng, const uint8_t *input, size_t len) {
     }
 
     for (size_t i = 0; i < len; i++) {
-        state = sheng_transition_scalar(sheng, state, input[i]);
+        uint8_t byte = input[i];
+
+        // Direct table lookup - masks[byte][state] gives next state
+        state = sheng->masks[byte][state];
 
         if (state == 0) {
-            // Dead state - restart
             state = DFA_START_STATE;
             if (sheng->accept_mask & (1 << state)) {
                 return true;
@@ -401,7 +294,10 @@ bool sheng_match_at(const ShengDfa *sheng, const uint8_t *input, size_t len,
     }
 
     for (size_t i = start; i < len; i++) {
-        state = sheng_transition_scalar(sheng, state, input[i]);
+        uint8_t byte = input[i];
+
+        // Direct table lookup
+        state = sheng->masks[byte][state];
 
         if (state == 0) {
             break;

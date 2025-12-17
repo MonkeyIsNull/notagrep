@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdio.h>
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -813,6 +814,152 @@ size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_
             last_line_end = nl ? (size_t)(nl - haystack) : haystack_len;
         }
         p = haystack + pos + 1;  // Move past this match
+    }
+
+    return lines;
+}
+
+// =============================================================================
+// Optimized line printing (search + line output in one pass)
+// =============================================================================
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+// SIMD-optimized version for ARM64: searches and prints lines in one pass
+static size_t print_lines_simd_packed_pair(const Prefilter *pf,
+                                            const uint8_t *haystack, size_t haystack_len,
+                                            FILE *out) {
+    if (pf->needle_len < 2) {
+        return 0;  // Not applicable
+    }
+
+    size_t lines = 0;
+    size_t last_line_end = SIZE_MAX;
+
+    const uint8_t *p = haystack;
+    const uint8_t *end = haystack + haystack_len - pf->needle_len + 1;
+
+    const size_t idx1 = pf->rare1_offset;
+    const size_t idx2 = pf->rare2_offset;
+    const size_t max_idx = (idx1 > idx2) ? idx1 : idx2;
+
+    const uint8x16_t v1 = vdupq_n_u8(pf->rare1);
+    const uint8x16_t v2 = vdupq_n_u8(pf->rare2);
+
+    const uint8_t *needle = pf->needle;
+    const size_t needle_len = pf->needle_len;
+
+    // Main SIMD loop
+    while (p + 16 + max_idx <= end) {
+        uint8x16_t chunk1 = vld1q_u8(p + idx1);
+        uint8x16_t chunk2 = vld1q_u8(p + idx2);
+        uint8x16_t eq1 = vceqq_u8(chunk1, v1);
+        uint8x16_t eq2 = vceqq_u8(chunk2, v2);
+        uint8x16_t match = vandq_u8(eq1, eq2);
+
+        uint64_t mask = neon_movemask(match);
+        while (mask) {
+            int idx = __builtin_ctzll(mask) >> 2;
+            const uint8_t *candidate = p + idx;
+            if (candidate < end) {
+                // Inline memcmp
+                size_t i = 0;
+                while (i < needle_len && candidate[i] == needle[i]) i++;
+                if (i == needle_len) {
+                    size_t pos = candidate - haystack;
+                    if (last_line_end == SIZE_MAX || pos > last_line_end) {
+                        // Find line boundaries
+                        const uint8_t *line_start = candidate;
+                        while (line_start > haystack && line_start[-1] != '\n') line_start--;
+
+                        const uint8_t *nl = memchr(candidate, '\n', haystack + haystack_len - candidate);
+                        const uint8_t *line_end = nl ? nl : haystack + haystack_len;
+
+                        // Write the line
+                        fwrite(line_start, 1, line_end - line_start, out);
+                        fputc('\n', out);
+
+                        lines++;
+                        last_line_end = (size_t)(line_end - haystack);
+                    }
+                }
+            }
+            mask &= mask - 1;
+        }
+        p += 16;
+    }
+
+    // Scalar tail
+    while (p < end) {
+        if (p[idx1] == pf->rare1 && p[idx2] == pf->rare2) {
+            size_t i = 0;
+            while (i < needle_len && p[i] == needle[i]) i++;
+            if (i == needle_len) {
+                size_t pos = p - haystack;
+                if (last_line_end == SIZE_MAX || pos > last_line_end) {
+                    const uint8_t *line_start = p;
+                    while (line_start > haystack && line_start[-1] != '\n') line_start--;
+
+                    size_t remaining = (size_t)((haystack + haystack_len) - p);
+                    const uint8_t *nl = memchr(p, '\n', remaining);
+                    const uint8_t *line_end = nl ? nl : haystack + haystack_len;
+
+                    fwrite(line_start, 1, line_end - line_start, out);
+                    fputc('\n', out);
+
+                    lines++;
+                    last_line_end = (size_t)(line_end - haystack);
+                }
+            }
+        }
+        p++;
+    }
+
+    return lines;
+}
+#endif
+
+size_t prefilter_print_lines(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
+                              FILE *out) {
+    if (!pf || !haystack || !out) {
+        return 0;
+    }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // Use SIMD path for large files (case-sensitive, needle >= 2 bytes)
+    if (pf->needle_len >= 2 && !pf->case_insensitive && haystack_len >= 64 * 1024) {
+        return print_lines_simd_packed_pair(pf, haystack, haystack_len, out);
+    }
+#endif
+
+    // Fallback: use find_first in a loop
+    size_t lines = 0;
+    size_t last_line_end = SIZE_MAX;
+
+    const uint8_t *p = haystack;
+    const uint8_t *end = haystack + haystack_len;
+
+    while (p < end) {
+        ssize_t found = prefilter_find_first(pf, p, end - p);
+        if (found < 0) break;
+
+        size_t pos = (p - haystack) + found;
+        if (last_line_end == SIZE_MAX || pos > last_line_end) {
+            // Find line boundaries
+            const uint8_t *match = haystack + pos;
+            const uint8_t *line_start = match;
+            while (line_start > haystack && line_start[-1] != '\n') line_start--;
+
+            const uint8_t *nl = memchr(match, '\n', haystack_len - pos);
+            const uint8_t *line_end = nl ? nl : haystack + haystack_len;
+
+            // Write the line
+            fwrite(line_start, 1, line_end - line_start, out);
+            fputc('\n', out);
+
+            lines++;
+            last_line_end = (size_t)(line_end - haystack);
+        }
+        p = haystack + pos + 1;
     }
 
     return lines;

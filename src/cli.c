@@ -199,8 +199,9 @@ int config_parse(Config *cfg, int argc, char **argv) {
 #endif
     }
 
-    // If searching multiple files/dirs, show filename by default
-    if (cfg->path_count > 1 || !cfg->from_stdin) {
+    // If searching multiple paths or a directory (not a single file), show filename by default
+    // Note: We set this here but main.c should override for single files
+    if (cfg->path_count > 1) {
         cfg->always_filename = true;
     }
 

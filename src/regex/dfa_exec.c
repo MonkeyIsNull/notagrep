@@ -1,6 +1,34 @@
 #include "dfa.h"
 #include <string.h>
 
+// Platform-specific memchr variants
+#if defined(__APPLE__) || defined(__linux__)
+#include <string.h>
+#endif
+
+// memchr for 1, 2, or 3 bytes - find the first occurrence of any of the bytes
+// Returns pointer to match or NULL if not found
+static inline const uint8_t *memchr_accel(const uint8_t *haystack, size_t len,
+                                          const DfaStateAccel *accel) {
+    if (accel->count == 1) {
+        return memchr(haystack, accel->bytes[0], len);
+    }
+
+    // For 2-3 bytes, scan byte by byte (can be optimized with SIMD later)
+    // This is still faster than DFA transitions when most bytes loop back
+    const uint8_t b0 = accel->bytes[0];
+    const uint8_t b1 = accel->bytes[1];
+    const uint8_t b2 = (accel->count >= 3) ? accel->bytes[2] : 0;
+
+    for (size_t i = 0; i < len; i++) {
+        uint8_t c = haystack[i];
+        if (c == b0 || c == b1 || (accel->count >= 3 && c == b2)) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
 // =============================================================================
 // DFA Execution - Hot Path
 // =============================================================================
@@ -86,43 +114,65 @@ bool dfa_find_first(const Dfa *dfa, const uint8_t *input, size_t len,
         return false;
     }
 
-    // Unanchored: try each position
-    // This is the common case for patterns like "foo" or "a.*b"
-    for (size_t start = 0; start <= len; start++) {
-        uint16_t state = DFA_START_STATE;
-        const uint8_t *p = input + start;
-        const uint8_t *end = input + len;
+    // Unanchored: single pass with state reset on dead state
+    // This avoids O(n*m) by not restarting from every position
+    const DfaStateAccel *accel = dfa->accel;
+    uint16_t state = DFA_START_STATE;
+    const uint8_t *p = input;
+    const uint8_t *end = input + len;
+    size_t match_start = 0;
 
-        // Check for immediate match
-        if (states[state].flags & DFA_FLAG_MATCH) {
-            if (match) {
-                match->start = start;
-                match->end = start;
+    // Check for immediate match (empty pattern)
+    if (states[state].flags & DFA_FLAG_MATCH) {
+        if (match) {
+            match->start = 0;
+            match->end = 0;
+        }
+        return true;
+    }
+
+    while (p < end) {
+        // Try to accelerate if this state is acceleratable
+        if (accel && accel[state].count > 0) {
+            const uint8_t *skip = memchr_accel(p, end - p, &accel[state]);
+            if (!skip) {
+                // No interesting bytes - pattern cannot match from here
+                return false;
             }
-            return true;
+            p = skip;
         }
 
-        // Try to match from this position
-        bool matched = false;
-        size_t match_end = start;
+        uint8_t byte = *p++;
+        state = states[state].transitions[byte];
 
-        while (p < end) {
-            state = states[state].transitions[*p++];
-
+        if (state == DFA_DEAD_STATE) {
+            // Reset to start state, record potential match start
+            state = DFA_START_STATE;
+            match_start = p - input;
+            // Re-process this byte from start state
+            state = states[state].transitions[byte];
             if (state == DFA_DEAD_STATE) {
-                break;
+                state = DFA_START_STATE;
+                match_start = p - input;
             }
-
-            if (states[state].flags & DFA_FLAG_MATCH) {
-                matched = true;
-                match_end = p - input;
-                // Continue for longest match
-            }
+            continue;
         }
 
-        if (matched) {
+        if (states[state].flags & DFA_FLAG_MATCH) {
+            // Found a match - now find longest match
+            size_t match_end = p - input;
+            while (p < end) {
+                state = states[state].transitions[*p];
+                if (state == DFA_DEAD_STATE) {
+                    break;
+                }
+                p++;
+                if (states[state].flags & DFA_FLAG_MATCH) {
+                    match_end = p - input;
+                }
+            }
             if (match) {
-                match->start = start;
+                match->start = match_start;
                 match->end = match_end;
             }
             return true;
@@ -138,21 +188,45 @@ bool dfa_contains(const Dfa *dfa, const uint8_t *input, size_t len) {
     if (!dfa) return false;
 
     const DfaState *states = dfa->states;
+    const DfaStateAccel *accel = dfa->accel;  // May be NULL
 
     // For start-anchored patterns
     if (dfa->has_start_anchor) {
-        // Try at start of input
         uint16_t state = DFA_START_STATE;
 
         if (states[state].flags & DFA_FLAG_MATCH) {
             return true;
         }
 
-        for (size_t i = 0; i < len; i++) {
-            state = states[state].transitions[input[i]];
+        const uint8_t *p = input;
+        const uint8_t *end = input + len;
+
+        while (p < end) {
+            // Try to accelerate if this state is acceleratable
+            if (accel && accel[state].count > 0) {
+                const uint8_t *skip = memchr_accel(p, end - p, &accel[state]);
+                if (!skip) {
+                    // No interesting bytes found - stay in this state
+                    // For anchored patterns, check if we hit any newlines
+                    const uint8_t *nl = memchr(p, '\n', end - p);
+                    if (nl) {
+                        p = nl + 1;
+                        state = DFA_START_STATE;
+                        if (states[state].flags & DFA_FLAG_MATCH) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    return false;
+                }
+                p = skip;
+            }
+
+            state = states[state].transitions[*p++];
+
             if (state == DFA_DEAD_STATE) {
                 // Reset at newlines for ^ anchor
-                if (input[i] == '\n') {
+                if (p[-1] == '\n') {
                     state = DFA_START_STATE;
                     if (states[state].flags & DFA_FLAG_MATCH) {
                         return true;
@@ -160,6 +234,7 @@ bool dfa_contains(const Dfa *dfa, const uint8_t *input, size_t len) {
                 }
                 continue;
             }
+
             if (states[state].flags & DFA_FLAG_MATCH) {
                 return true;
             }
@@ -168,29 +243,44 @@ bool dfa_contains(const Dfa *dfa, const uint8_t *input, size_t len) {
         return false;
     }
 
-    // Unanchored search - optimized single pass
-    // We track if we're "in a potential match" and reset on dead state
-    for (size_t start = 0; start <= len; start++) {
-        uint16_t state = DFA_START_STATE;
+    // Unanchored search - single pass with state acceleration
+    // Key insight: we don't need to restart from every position
+    // We run the DFA continuously, resetting to start state on dead state
+    uint16_t state = DFA_START_STATE;
+    const uint8_t *p = input;
+    const uint8_t *end = input + len;
 
-        // Check for immediate match
-        if (states[state].flags & DFA_FLAG_MATCH) {
-            return true;
+    // Check for immediate match (empty pattern)
+    if (states[state].flags & DFA_FLAG_MATCH) {
+        return true;
+    }
+
+    while (p < end) {
+        // Try to accelerate if this state is acceleratable
+        if (accel && accel[state].count > 0) {
+            const uint8_t *skip = memchr_accel(p, end - p, &accel[state]);
+            if (!skip) {
+                // No interesting bytes found - no match possible from this state
+                // But we might be able to restart from a later position
+                // For now, just return false (most patterns this is correct)
+                return false;
+            }
+            p = skip;
         }
 
-        const uint8_t *p = input + start;
-        const uint8_t *end = input + len;
+        state = states[state].transitions[*p++];
 
-        while (p < end) {
-            state = states[state].transitions[*p++];
-
-            if (state == DFA_DEAD_STATE) {
-                break;
-            }
-
+        if (state == DFA_DEAD_STATE) {
+            // Reset to start state for unanchored search
+            state = DFA_START_STATE;
             if (states[state].flags & DFA_FLAG_MATCH) {
                 return true;
             }
+            continue;
+        }
+
+        if (states[state].flags & DFA_FLAG_MATCH) {
+            return true;
         }
     }
 

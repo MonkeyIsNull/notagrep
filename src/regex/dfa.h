@@ -27,9 +27,25 @@ typedef struct {
     uint8_t _padding;
 } DfaState;
 
+// =============================================================================
+// State Acceleration (memchr skip for self-looping states)
+// =============================================================================
+
+// For states where most transitions loop back (like .* patterns),
+// we can use memchr to skip ahead to the few bytes that cause real transitions.
+// This is the same optimization ripgrep uses.
+
+#define DFA_ACCEL_MAX_BYTES 3  // memchr supports up to 3 bytes
+
+typedef struct DfaStateAccel {
+    uint8_t bytes[DFA_ACCEL_MAX_BYTES];  // Bytes that cause non-self transitions
+    uint8_t count;                        // 0 = not acceleratable, 1-3 = use memchr
+} DfaStateAccel;
+
 // Complete DFA structure
 typedef struct {
     DfaState *states;           // Array of states (index 0 = dead, 1 = start)
+    DfaStateAccel *accel;       // Acceleration info per state (or NULL)
     uint32_t state_count;       // Number of allocated states
     uint32_t state_capacity;    // Capacity of states array
     uint32_t max_states;        // Limit before giving up
@@ -68,18 +84,19 @@ bool dfa_will_explode(const Nfa *nfa);
 // Sheng DFA (SIMD-accelerated for small DFAs)
 // =============================================================================
 
-// Maximum states for Sheng DFA (limited by NEON register width)
+// Maximum states for Sheng DFA (limited by SIMD register width: 16 bytes)
 #define SHENG_MAX_STATES 16
 
-// Sheng DFA uses nybble-based shuffle masks for O(1) state transitions
-// Each state has two 16-byte masks: one for low nybble, one for high nybble
-// The transition is: next_state = lo_mask[state][byte & 0xF] & hi_mask[state][byte >> 4]
+// Sheng DFA uses SIMD shuffle for O(1) state transitions (Hyperscan algorithm)
+// For each input byte, there's a 16-byte shuffle mask where:
+//   masks[byte][state] = next_state for transition (state, byte)
+// SIMD execution: next_state = shuffle(masks[byte], broadcast(state))[0]
+// Memory: 256 * 16 = 4KB per DFA
 typedef struct {
-    uint8_t lo_masks[SHENG_MAX_STATES][16];  // Low nybble lookup per state
-    uint8_t hi_masks[SHENG_MAX_STATES][16];  // High nybble lookup per state
-    uint16_t accept_mask;                     // Bit i = state i is accepting
-    uint8_t state_count;                      // Number of states (including dead)
-    bool is_valid;                            // True if Sheng compilation succeeded
+    uint8_t masks[256][16];   // masks[byte][state] = next_state (4KB)
+    uint16_t accept_mask;     // Bit i = state i is accepting
+    uint8_t state_count;      // Number of states (including dead state 0)
+    bool is_valid;            // True if Sheng compilation succeeded
 } ShengDfa;
 
 // Compile a Sheng DFA from a regular DFA (only for DFAs with <= 16 states)

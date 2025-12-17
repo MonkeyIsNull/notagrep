@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include "teddy.h"
 #include "teddy_multi.h"
@@ -88,6 +89,12 @@ bool prefilter_contains(const Prefilter *pf, const uint8_t *haystack, size_t hay
 // Count number of unique lines containing the needle (for -c mode)
 // This is more efficient than using prefilter_search with a callback
 size_t prefilter_count_lines(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len);
+
+// Print all unique lines containing the needle directly to output
+// This integrates search + line detection + output in one pass for maximum performance
+// Returns number of unique lines printed
+size_t prefilter_print_lines(const Prefilter *pf, const uint8_t *haystack, size_t haystack_len,
+                              FILE *out);
 
 // =============================================================================
 // Multi-literal prefilter (for alternation patterns)

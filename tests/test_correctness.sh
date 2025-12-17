@@ -73,11 +73,9 @@ run_test() {
     local file="$3"
     local flags="${4:-}"
 
-    # grep without -H doesn't show filename for single file
-    # notagrep with -H always shows filename, so strip it for comparison
+    # Both grep and notagrep don't show filename for single file
     local grep_out=$(grep $flags -E "$pattern" "$file" 2>/dev/null | sort || true)
-    # Strip "filename:" prefix from notagrep output
-    local ng_out=$($NOTAGREP $flags "$pattern" "$file" 2>/dev/null | sed 's/^[^:]*://' | sort || true)
+    local ng_out=$($NOTAGREP $flags "$pattern" "$file" 2>/dev/null | sort || true)
 
     if [ "$grep_out" = "$ng_out" ]; then
         echo -e "${GREEN}PASS${NC}: $name"
@@ -102,8 +100,9 @@ run_count_test() {
     local flags="${4:-}"
 
     # For count test, grep -c counts matching lines, notagrep should match
+    # Single file output has no filename prefix, just the count
     local grep_count=$(grep $flags -c -E "$pattern" "$file" 2>/dev/null || echo "0")
-    local ng_count=$($NOTAGREP $flags -c "$pattern" "$file" 2>/dev/null | cut -d: -f2 || echo "0")
+    local ng_count=$($NOTAGREP $flags -c "$pattern" "$file" 2>/dev/null || echo "0")
 
     if [ "$grep_count" = "$ng_count" ]; then
         echo -e "${GREEN}PASS${NC}: $name (count=$grep_count)"

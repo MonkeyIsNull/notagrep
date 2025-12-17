@@ -204,16 +204,18 @@ CompiledRegex *regex_compile(const char *pattern, size_t len,
         if (re->dfa && re->dfa->is_complete) {
             re->use_dfa = true;
 
-            // Try to compile Sheng SIMD DFA for small DFAs (<=16 states)
-            // Skip Sheng for anchored patterns as it doesn't handle anchors
-            // Note: Sheng is currently disabled (sheng_compile returns false)
-            // The nybble-decomposition approach requires more complex encoding
+            // Sheng SIMD DFA disabled - benchmarking shows it's ~24% SLOWER than
+            // regular DFA due to poor cache locality (4KB of masks vs 512B per state)
+            // The SIMD shuffle doesn't compensate for the cache misses.
+            // State acceleration (memchr skip) is a better optimization for grep.
+            #if 0
             if (re->dfa->state_count <= SHENG_MAX_STATES &&
                 !re->dfa->has_start_anchor && !re->dfa->has_end_anchor) {
                 if (sheng_compile(&re->sheng, re->dfa)) {
                     re->use_sheng = true;
                 }
             }
+            #endif
         }
     }
 
@@ -750,7 +752,34 @@ size_t regex_find_all_ts(CompiledRegex *re, ExecContext *ctx,
         return fctx.count;
     }
 
-    // No prefilter: full NFA search
+    // No prefilter: try DFA if available, otherwise NFA
+    if (re->use_dfa) {
+        // DFA single-pass search - faster than NFA for patterns without prefilters
+        size_t count = 0;
+        size_t pos = 0;
+
+        while (pos < input_len) {
+            Match m;
+            // Use line-scoped DFA search
+            const uint8_t *line_end_ptr = memchr(input + pos, '\n', input_len - pos);
+            size_t line_end = line_end_ptr ? (size_t)(line_end_ptr - input) + 1 : input_len;
+
+            if (dfa_find_first(re->dfa, input + pos, line_end - pos, &m)) {
+                m.start += pos;
+                m.end += pos;
+                count++;
+                if (cb) cb(&m, user_data);
+                // Skip to after the match
+                pos = m.end > pos ? m.end : pos + 1;
+            } else {
+                // No match on this line, skip to next
+                pos = line_end;
+            }
+        }
+        return count;
+    }
+
+    // Fallback: full NFA search
     return nfa_find_all(re->nfa, ctx, input, input_len,
                        (match_callback)cb, user_data);
 }

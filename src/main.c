@@ -11,6 +11,10 @@
 #include <string.h>
 #include <sys/stat.h>
 
+// Large output buffer for high-volume results (64KB)
+#define OUTPUT_BUFFER_SIZE (64 * 1024)
+static char output_buffer[OUTPUT_BUFFER_SIZE];
+
 // Binary detection threshold (4KB)
 #define BINARY_CHECK_BYTES 4096
 
@@ -172,6 +176,14 @@ static bool search_file_worker(const char *path, ThreadContext *tctx) {
                 // Directly update printer state for count mode (bypass callback overhead)
                 printer.lines_matched = lines;
             }
+        } else if (!global->out_cfg->show_filename && !global->out_cfg->show_line_numbers && !global->pool) {
+            // Fast path: integrated SIMD search + line output (no callback overhead)
+            // Only used in single-threaded mode to avoid output interleaving
+            size_t lines = prefilter_print_lines(global->pattern->prefilter, fb->data, fb->size, stdout);
+            if (lines > 0) {
+                mctx.found_any = true;
+                printer.lines_matched = lines;
+            }
         } else {
             prefilter_search(global->pattern->prefilter, fb->data, fb->size,
                             prefilter_match_handler, &mctx);
@@ -189,6 +201,7 @@ static bool search_file_worker(const char *path, ThreadContext *tctx) {
         }
         printer_finish(&printer);
 
+        // ALWAYS report match to pool if it exists (for exit code tracking)
         if (global->pool) {
             threadpool_report_match(global->pool);
         }
@@ -252,6 +265,9 @@ static bool walk_callback_single(const char *path, void *user_data) {
 }
 
 int main(int argc, char **argv) {
+    // Set large output buffer for better performance with many matches
+    setvbuf(stdout, output_buffer, _IOFBF, OUTPUT_BUFFER_SIZE);
+
     Config cfg;
     int result = config_parse(&cfg, argc, argv);
 
@@ -294,8 +310,21 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Determine if we should show filenames:
+    // - Always show if -H was specified
+    // - Show if multiple paths or if any path is a directory
+    bool show_filename = cfg.always_filename;
+    if (!show_filename && cfg.path_count == 1) {
+        struct stat st;
+        if (stat(cfg.paths[0], &st) == 0 && S_ISDIR(st.st_mode)) {
+            show_filename = true;  // Searching a directory
+        }
+    } else if (cfg.path_count > 1) {
+        show_filename = true;
+    }
+
     OutputConfig out_cfg = {
-        .show_filename = cfg.always_filename,
+        .show_filename = show_filename,
         .show_line_numbers = cfg.line_numbers,
         .list_files_only = cfg.list_files,
         .count_only = cfg.count_only,
@@ -380,8 +409,8 @@ int main(int argc, char **argv) {
     // Cleanup
     if (use_parallel) {
         // Get match count before destroying the pool
-        found_count = threadpool_files_matched(&pool);
-        threadpool_destroy(&pool);
+        threadpool_destroy(&pool);  // Wait for all work to complete first
+        found_count = threadpool_files_matched(&pool);  // Then get the count
     } else {
         file_buffer_free(&single_ctx.fb);
         if (single_ctx.exec_ctx_initialized) {
