@@ -26,6 +26,10 @@ typedef struct {
     size_t last_line_end;      // End of last printed line (for forward scanning)
     bool printed_filename;     // For -l mode
     bool printed_any_line;     // Whether we've printed any line yet
+
+    // Incremental line number tracking (for -n mode optimization)
+    size_t last_line_number;      // Line number of last processed line
+    size_t last_line_number_pos;  // Position (start) of that line
 } Printer;
 
 // Initialize printer for a file
