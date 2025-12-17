@@ -1,4 +1,5 @@
 #include "regex.h"
+#include "dfa.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -186,7 +187,7 @@ CompiledRegex *regex_compile(const char *pattern, size_t len,
         return NULL;
     }
 
-    // Initialize execution context
+    // Initialize execution context (for NFA fallback)
     if (exec_context_init(&re->exec_ctx, re->nfa->count) < 0) {
         nfa_free(re->nfa);
         if (re->has_prefilter) {
@@ -196,6 +197,26 @@ CompiledRegex *regex_compile(const char *pattern, size_t len,
         return NULL;
     }
 
+    // Try to compile DFA for fast matching
+    // Skip DFA if pattern is likely to cause state explosion
+    if (!dfa_will_explode(re->nfa)) {
+        re->dfa = dfa_compile(re->nfa, DFA_MAX_STATES_DEFAULT);
+        if (re->dfa && re->dfa->is_complete) {
+            re->use_dfa = true;
+
+            // Try to compile Sheng SIMD DFA for small DFAs (<=16 states)
+            // Skip Sheng for anchored patterns as it doesn't handle anchors
+            // Note: Sheng is currently disabled (sheng_compile returns false)
+            // The nybble-decomposition approach requires more complex encoding
+            if (re->dfa->state_count <= SHENG_MAX_STATES &&
+                !re->dfa->has_start_anchor && !re->dfa->has_end_anchor) {
+                if (sheng_compile(&re->sheng, re->dfa)) {
+                    re->use_sheng = true;
+                }
+            }
+        }
+    }
+
     return re;
 }
 
@@ -203,6 +224,7 @@ void regex_free(CompiledRegex *re) {
     if (!re) return;
 
     nfa_free(re->nfa);
+    dfa_free(re->dfa);
     exec_context_free(&re->exec_ctx);
 
     if (re->has_prefilter) {
@@ -294,26 +316,36 @@ static void prefilter_match_handler(size_t pos, void *ctx) {
         return;
     }
 
-    // For inner prefilter (patterns like .*foo.*), the NFA must start at
-    // line start, not at the inner literal position. The .* at the beginning
-    // needs to match from line start to the inner literal.
-    size_t nfa_start = pos;
+    // For inner prefilter (patterns like .*foo.*), must start at line start
+    size_t match_start = pos;
     if (fctx->is_inner_prefilter) {
-        nfa_start = find_line_start_before(fctx->input, pos);
-        // Skip if we already matched a line starting before this one
-        if (nfa_start < fctx->last_match_end) {
+        match_start = find_line_start_before(fctx->input, pos);
+        if (match_start < fctx->last_match_end) {
             return;
         }
     }
 
     Match m;
-    if (nfa_match_at(fctx->re->nfa, &fctx->re->exec_ctx,
-                     fctx->input, fctx->input_len, nfa_start, &m)) {
+    bool matched;
+
+    // Use Sheng SIMD DFA if available (fastest), else DFA, else NFA
+    if (fctx->re->use_sheng) {
+        matched = sheng_match_at(&fctx->re->sheng, fctx->input, fctx->input_len,
+                                 match_start, &m);
+    } else if (fctx->re->use_dfa) {
+        matched = dfa_match_at(fctx->re->dfa, fctx->input, fctx->input_len,
+                               match_start, &m);
+    } else {
+        matched = nfa_match_at(fctx->re->nfa, &fctx->re->exec_ctx,
+                               fctx->input, fctx->input_len, match_start, &m);
+    }
+
+    if (matched) {
         fctx->count++;
         if (fctx->user_cb) {
             fctx->user_cb(&m, fctx->user_data);
         }
-        fctx->last_match_end = m.end > nfa_start ? m.end : nfa_start + 1;
+        fctx->last_match_end = m.end > match_start ? m.end : match_start + 1;
     }
 }
 
@@ -557,24 +589,36 @@ static void prefilter_match_handler_ts(size_t pos, void *ctx) {
         return;
     }
 
-    // For inner prefilter (patterns like .*foo.*), the NFA must start at
-    // line start, not at the inner literal position.
-    size_t nfa_start = pos;
+    // For inner prefilter (patterns like .*foo.*), must start at line start
+    size_t match_start = pos;
     if (fctx->is_inner_prefilter) {
-        nfa_start = find_line_start_before(fctx->input, pos);
-        if (nfa_start < fctx->last_match_end) {
+        match_start = find_line_start_before(fctx->input, pos);
+        if (match_start < fctx->last_match_end) {
             return;
         }
     }
 
     Match m;
-    if (nfa_match_at(fctx->re->nfa, fctx->ctx,
-                     fctx->input, fctx->input_len, nfa_start, &m)) {
+    bool matched;
+
+    // Use Sheng SIMD DFA if available (fastest), else DFA, else NFA
+    if (fctx->re->use_sheng) {
+        matched = sheng_match_at(&fctx->re->sheng, fctx->input, fctx->input_len,
+                                 match_start, &m);
+    } else if (fctx->re->use_dfa) {
+        matched = dfa_match_at(fctx->re->dfa, fctx->input, fctx->input_len,
+                               match_start, &m);
+    } else {
+        matched = nfa_match_at(fctx->re->nfa, fctx->ctx,
+                               fctx->input, fctx->input_len, match_start, &m);
+    }
+
+    if (matched) {
         fctx->count++;
         if (fctx->user_cb) {
             fctx->user_cb(&m, fctx->user_data);
         }
-        fctx->last_match_end = m.end > nfa_start ? m.end : nfa_start + 1;
+        fctx->last_match_end = m.end > match_start ? m.end : match_start + 1;
     }
 }
 
@@ -723,7 +767,8 @@ bool regex_contains_ts(CompiledRegex *re, ExecContext *ctx,
             return true;
         }
 
-        // Prefilter found candidate, verify with NFA
+        // Prefilter found candidate, verify with NFA at candidate position
+        // (NFA verification at a point is faster than DFA full scan)
         return regex_find_first_ts(re, ctx, input, input_len, NULL);
     }
 
@@ -754,6 +799,14 @@ bool regex_contains_ts(CompiledRegex *re, ExecContext *ctx,
 
         // Inner literal found, verify with NFA
         return regex_find_first_ts(re, ctx, input, input_len, NULL);
+    }
+
+    // No prefilter: Sheng SIMD or DFA for full input scan
+    if (re->use_sheng) {
+        return sheng_contains(&re->sheng, input, input_len);
+    }
+    if (re->use_dfa) {
+        return dfa_contains(re->dfa, input, input_len);
     }
 
     return nfa_contains(re->nfa, ctx, input, input_len);
@@ -810,9 +863,14 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
                 continue;
             }
 
-            // Verify with NFA
+            // Verify with Sheng/DFA/NFA (fastest to slowest)
             Match m;
-            if (nfa_match_at(re->nfa, ctx, input, input_len, line_start, &m)) {
+            bool matched = re->use_sheng
+                ? sheng_match_at(&re->sheng, input, input_len, line_start, &m)
+                : re->use_dfa
+                    ? dfa_match_at(re->dfa, input, input_len, line_start, &m)
+                    : nfa_match_at(re->nfa, ctx, input, input_len, line_start, &m);
+            if (matched) {
                 lines++;
                 // Find end of line
                 const uint8_t *nl = memchr(input + candidate, '\n', input_len - candidate);
@@ -824,14 +882,12 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
         return lines;
     }
 
-    // Prefix prefilter + NFA with line counting
+    // Prefix prefilter + verification with line counting
     if (re->has_prefilter) {
         // If we have all-literals prefilter (e.g., for "func.*return"),
         // use multi-literal SIMD to find candidate lines more efficiently
         if (re->has_all_literals_prefilter && re->all_literals_prefilter.use_teddy_multi) {
-            // Use TeddyMulti SIMD to find ANY literal, then verify with NFA
-            // Strategy: find any literal, get the line, then use prefix literal
-            // to find the actual start position for NFA verification
+            // Use TeddyMulti SIMD to find ANY literal, then verify
             size_t lines = 0;
             size_t last_line_end = SIZE_MAX;
             size_t pos = 0;
@@ -862,7 +918,7 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
                     continue;
                 }
 
-                // Now find the prefix literal on this line for proper NFA starting position
+                // Now find the prefix literal on this line for proper starting position
                 ssize_t prefix_pos = prefilter_find_first(&re->prefilter,
                                                            input + line_st, line_ed - line_st);
                 if (prefix_pos < 0) {
@@ -871,10 +927,15 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
                     continue;
                 }
 
-                // Verify with NFA starting at prefix position
-                size_t nfa_start = line_st + (size_t)prefix_pos;
+                // Verify with Sheng/DFA/NFA starting at prefix position
+                size_t verify_start = line_st + (size_t)prefix_pos;
                 Match m;
-                if (nfa_match_at(re->nfa, ctx, input, input_len, nfa_start, &m)) {
+                bool matched = re->use_sheng
+                    ? sheng_match_at(&re->sheng, input, input_len, verify_start, &m)
+                    : re->use_dfa
+                        ? dfa_match_at(re->dfa, input, input_len, verify_start, &m)
+                        : nfa_match_at(re->nfa, ctx, input, input_len, verify_start, &m);
+                if (matched) {
                     lines++;
                     last_line_end = line_ed;
                 }
@@ -902,9 +963,14 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
                 continue;
             }
 
-            // Verify with NFA
+            // Verify with Sheng/DFA/NFA (fastest to slowest)
             Match m;
-            if (nfa_match_at(re->nfa, ctx, input, input_len, candidate, &m)) {
+            bool matched = re->use_sheng
+                ? sheng_match_at(&re->sheng, input, input_len, candidate, &m)
+                : re->use_dfa
+                    ? dfa_match_at(re->dfa, input, input_len, candidate, &m)
+                    : nfa_match_at(re->nfa, ctx, input, input_len, candidate, &m);
+            if (matched) {
                 lines++;
                 // Find end of line
                 const uint8_t *nl = memchr(input + candidate, '\n', input_len - candidate);
@@ -914,6 +980,11 @@ size_t regex_count_lines_ts(CompiledRegex *re, ExecContext *ctx,
             pos = candidate + 1;
         }
         return lines;
+    }
+
+    // DFA fast path for count mode (no prefilter)
+    if (re->use_dfa) {
+        return dfa_count_lines(re->dfa, input, input_len);
     }
 
     // No prefilter: full NFA search with line counting
@@ -1010,5 +1081,21 @@ void regex_debug_print(const CompiledRegex *re, const char *pattern) {
 
     // NFA info
     fprintf(stderr, "\nNFA states: %zu\n", re->nfa->count);
+
+    // DFA info
+    if (re->dfa) {
+        fprintf(stderr, "DFA: %u states (", re->dfa->state_count);
+        if (re->use_dfa) {
+            fprintf(stderr, "ACTIVE");
+        } else {
+            fprintf(stderr, "compiled but not used");
+        }
+        fprintf(stderr, ")\n");
+        if (re->dfa->has_start_anchor) fprintf(stderr, "  Start anchor: yes\n");
+        if (re->dfa->has_end_anchor) fprintf(stderr, "  End anchor: yes\n");
+    } else {
+        fprintf(stderr, "DFA: not compiled\n");
+    }
+
     fprintf(stderr, "========================\n\n");
 }

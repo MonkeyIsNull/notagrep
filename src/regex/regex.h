@@ -4,6 +4,7 @@
 #include "ast.h"
 #include "parse.h"
 #include "nfa.h"
+#include "dfa.h"
 #include "exec.h"
 #include "literal.h"
 #include "../search/prefilter.h"
@@ -14,8 +15,12 @@
 
 // Compiled regex pattern
 typedef struct {
-    Nfa *nfa;                   // NFA for matching
-    ExecContext exec_ctx;       // Reusable execution context
+    Nfa *nfa;                   // NFA for matching (fallback)
+    Dfa *dfa;                   // DFA for matching (fast path, may be NULL)
+    ShengDfa sheng;             // Sheng SIMD DFA for small patterns (<=16 states)
+    bool use_dfa;               // True if DFA should be used
+    bool use_sheng;             // True if Sheng SIMD DFA should be used
+    ExecContext exec_ctx;       // Reusable execution context (for NFA)
 
     // Single-literal prefilter for acceleration
     bool has_prefilter;
