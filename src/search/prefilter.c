@@ -958,7 +958,8 @@ size_t prefilter_print_lines(const Prefilter *pf, const uint8_t *haystack, size_
 #if defined(__aarch64__) || defined(_M_ARM64)
     // Use pattern-first approach for large files - finds matches then outputs lines
     // Key optimization: skip to next line after each match
-    if (!pf->case_insensitive && haystack_len >= 64 * 1024) {
+    // Threshold at 256KB to avoid malloc overhead for smaller files
+    if (!pf->case_insensitive && haystack_len >= 256 * 1024) {
         return print_lines_pattern_first(pf, haystack, haystack_len, out);
     }
 #endif
@@ -1008,7 +1009,8 @@ size_t prefilter_print_lines_with_filename(const Prefilter *pf, const uint8_t *h
 
 #if defined(__aarch64__) || defined(_M_ARM64)
     // Use batched pattern-first path for large files (case-sensitive)
-    if (!pf->case_insensitive && haystack_len >= 64 * 1024) {
+    // Threshold at 256KB to avoid malloc overhead for smaller files
+    if (!pf->case_insensitive && haystack_len >= 256 * 1024) {
         return print_lines_pattern_first_with_filename(pf, haystack, haystack_len,
                                                         filename, filename_len, out);
     }
